@@ -7,7 +7,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::thread;
@@ -26,28 +26,47 @@ use crate::spec::{self, Hints, MirrorSpec, Mode};
 const DETACH: u8 = 0x1d; // ctrl+]
 const LAYOUT_POLL: Duration = Duration::from_secs(1);
 const STATUS_POLL: Duration = Duration::from_secs(2);
-const SOURCE_RETRY: Duration = Duration::from_secs(5);
 const RESIZE_SETTLE: Duration = Duration::from_millis(50);
 const IDLE_TICK: Duration = Duration::from_millis(200);
+
+/// Stream generations are unique for the whole process, so a frame from a
+/// stream that belonged to an earlier connection is never drawn.
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 enum Event {
     Input(Vec<u8>),
     InputClosed,
     Resized,
-    Frame { generation: u64, bytes: Vec<u8> },
-    ObserveEnded { generation: u64, note: String },
+    Frame {
+        generation: u64,
+        bytes: Vec<u8>,
+    },
+    ObserveEnded {
+        generation: u64,
+        note: String,
+    },
     ControlEnded(String),
     NaturalSize(Size),
     SourceInfo(Value),
     SourceMissing(String),
+    /// A background lookup found the source (possibly under a new pane id).
+    SourceFound {
+        pane: Value,
+        machine: Option<Machine>,
+        source: String,
+    },
+    SourceLookupFailed(String),
 }
 
-/// How the mirror ended.
+/// How a mirror's connection ended.
 enum Exit {
     /// The user quit with ctrl+]: release the pane.
     Quit,
     /// The pane closed under us, e.g. at server shutdown: keep the resume command.
     Closed,
+    /// The source stopped answering (network, sleep, a restarting machine):
+    /// reconnect.
+    Lost(String),
 }
 
 pub fn run(args: &[String]) -> Result<(), String> {
@@ -59,23 +78,47 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let mut reporter = Reporter::start();
     let resumable = on_path("remuda");
     let mut presence = None;
+    let mut lost: Option<String> = None;
 
-    let outcome = match wait_for_source(&mut spec, &inbox, &mut reporter, resumable) {
-        Ok(Waited::Found { pane, machine }) => {
-            spec.hints = Hints::from_pane(&pane);
-            Mirror::new(spec, machine, &pane, events, reporter.take(), resumable).and_then(
-                |mut mirror| {
-                    let exit = mirror.event_loop(&inbox);
-                    mirror.stop_streams();
-                    reporter = mirror.reporter.take();
-                    presence = mirror.presence.take();
-                    exit
-                },
-            )
+    let outcome = loop {
+        let waited = wait_for_source(
+            &mut spec,
+            &events,
+            &inbox,
+            &mut reporter,
+            resumable,
+            lost.as_deref(),
+        );
+        let (pane, machine) = match waited {
+            Waited::Found { pane, machine } => (pane, machine),
+            Waited::Quit => break Ok(Exit::Quit),
+            Waited::Closed => break Ok(Exit::Closed),
+        };
+        spec.hints = Hints::from_pane(&pane);
+        let exit = match Mirror::new(
+            spec.clone(),
+            machine,
+            &pane,
+            events.clone(),
+            reporter.take(),
+            resumable,
+        ) {
+            Ok(mut mirror) => {
+                let exit = mirror.event_loop(&inbox);
+                mirror.stop_streams();
+                reporter = mirror.reporter.take();
+                spec = mirror.spec.clone();
+                // A reconnect marks the source again under the same metadata
+                // source; until then the old mark's TTL covers the gap.
+                presence = mirror.presence.take();
+                exit
+            }
+            Err(err) => Ok(Exit::Lost(err)),
+        };
+        match exit {
+            Ok(Exit::Lost(why)) => lost = Some(why),
+            other => break other,
         }
-        Ok(Waited::Quit) => Ok(Exit::Quit),
-        Ok(Waited::Closed) => Ok(Exit::Closed),
-        Err(err) => Err(err),
     };
     drop(screen);
     // However the mirror ended, it no longer watches the source. A resumed
@@ -122,52 +165,114 @@ enum Waited {
     Closed,
 }
 
-/// Finds the source, retrying while it is missing (after a restart, before a
-/// machine reconnects) and showing why. Updates `spec.source` if the pane was
-/// found again under a new id.
+/// Delay before lookup attempt `attempt` (0-based) after a failure.
+fn retry_delay(attempt: u32) -> Duration {
+    const DELAYS: [u64; 5] = [1, 2, 4, 8, 15];
+    Duration::from_secs(DELAYS[(attempt as usize).min(DELAYS.len() - 1)])
+}
+
+/// Finds the source, retrying with backoff while it is missing or its machine
+/// does not answer, and shows why. `lost` is why the previous connection
+/// ended, when this is a reconnect: the last frame then stays on screen under
+/// a "reconnecting" status bar. Updates `spec.source` if the pane was found
+/// again under a new id.
+///
+/// Lookups run on a background thread, so ctrl+] works while a machine hangs.
 fn wait_for_source(
     spec: &mut MirrorSpec,
+    events: &Sender<Event>,
     inbox: &Receiver<Event>,
     reporter: &mut Option<Reporter>,
     resumable: bool,
-) -> Result<Waited, String> {
-    loop {
-        let why = match find_source(spec) {
-            Ok((pane, machine)) => return Ok(Waited::Found { pane, machine }),
-            Err(why) => why,
+    lost: Option<&str>,
+) -> Waited {
+    let place = spec.place().to_string();
+    let draw = |why: &str, retry_in: Option<Duration>| {
+        let mut line = match lost {
+            Some(_) => format!(" {MARK} remuda · {place} {} · reconnecting", spec.source),
+            None => format!(" {MARK} remuda · {place} {}", spec.source),
         };
+        if !why.is_empty() {
+            line.push_str(&format!(" · {why}"));
+        }
+        if let Some(delay) = retry_in {
+            line.push_str(&format!(" · retry in {}s", delay.as_secs().max(1)));
+        }
+        line.push_str(" · ctrl+] quit ");
+        if lost.is_some() {
+            draw_bar(&line);
+        } else {
+            let (cols, _) = crossterm::terminal::size().unwrap_or((80, 24));
+            let line: String = line.chars().take(usize::from(cols)).collect();
+            write_out(format!("\x1b[2J\x1b[H{line}").as_bytes());
+        }
+    };
+
+    let mut attempt = 0;
+    let mut why = lost.unwrap_or("connecting").to_string();
+    loop {
+        draw(&why, None);
+        let lookup = spec.clone();
+        let sender = events.clone();
+        thread::spawn(move || {
+            let event = match find_source(&lookup) {
+                Ok((pane, machine, source)) => Event::SourceFound {
+                    pane,
+                    machine,
+                    source,
+                },
+                Err(why) => Event::SourceLookupFailed(why),
+            };
+            let _ = sender.send(event);
+        });
+
+        // Wait for this lookup's answer, staying responsive to input.
+        loop {
+            match inbox.recv() {
+                Ok(Event::Input(bytes)) if bytes.contains(&DETACH) => return Waited::Quit,
+                Ok(Event::InputClosed) | Err(_) => return Waited::Closed,
+                Ok(Event::Resized) => draw(&why, None),
+                Ok(Event::SourceFound {
+                    pane,
+                    machine,
+                    source,
+                }) => {
+                    spec.source = source;
+                    return Waited::Found { pane, machine };
+                }
+                Ok(Event::SourceLookupFailed(failure)) => {
+                    why = failure;
+                    break;
+                }
+                // Leftovers from the previous connection's streams and pollers.
+                Ok(_) => {}
+            }
+        }
+
         if let Some(reporter) = reporter {
             reporter.report(mirror_report(spec, None, resumable));
         }
-        let draw = |why: &str| {
-            let (cols, _) = crossterm::terminal::size().unwrap_or((80, 24));
-            let line = format!(" {MARK} remuda · {} {} · {why}", spec.place(), spec.source);
-            let line: String = line.chars().take(usize::from(cols)).collect();
-            write_out(
-                format!(
-                    "\x1b[2J\x1b[H{line}\r\n\r\n retrying every {}s · ctrl+] quit",
-                    SOURCE_RETRY.as_secs()
-                )
-                .as_bytes(),
-            );
-        };
-        draw(&why);
-        let deadline = Instant::now() + SOURCE_RETRY;
+        let deadline = Instant::now() + retry_delay(attempt);
+        attempt += 1;
         loop {
-            match inbox.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-                Ok(Event::Input(bytes)) if bytes.contains(&DETACH) => return Ok(Waited::Quit),
+            let left = deadline.saturating_duration_since(Instant::now());
+            draw(&why, Some(left));
+            match inbox.recv_timeout(left.min(Duration::from_secs(1))) {
+                Ok(Event::Input(bytes)) if bytes.contains(&DETACH) => return Waited::Quit,
                 Ok(Event::InputClosed) | Err(RecvTimeoutError::Disconnected) => {
-                    return Ok(Waited::Closed)
+                    return Waited::Closed
                 }
-                Ok(Event::Resized) => draw(&why),
-                Ok(_) => {}
-                Err(RecvTimeoutError::Timeout) => break,
+                Ok(_) | Err(RecvTimeoutError::Timeout) => {}
+            }
+            if Instant::now() >= deadline {
+                break;
             }
         }
     }
 }
 
-fn find_source(spec: &mut MirrorSpec) -> Result<(Value, Option<Machine>), String> {
+/// Looks the source up: its pane info, its machine, and its (possibly new) id.
+fn find_source(spec: &MirrorSpec) -> Result<(Value, Option<Machine>, String), String> {
     let machine = match spec.machine.as_deref() {
         Some(label) => Some(
             herdr::machine_by_label(label)
@@ -175,15 +280,32 @@ fn find_source(spec: &mut MirrorSpec) -> Result<(Value, Option<Machine>), String
         ),
         None => None,
     };
-    let result = herdr::json(&["pane", "list"], spec.machine.as_deref())?;
+    let result = herdr::json(&["pane", "list"], spec.machine.as_deref())
+        .map_err(|_| format!("{} not answering", spec.place()))?;
     let panes = result["panes"].as_array().cloned().unwrap_or_default();
     let id = spec::resolve_source(spec, &panes).ok_or("source missing")?;
     let pane = panes
         .into_iter()
         .find(|pane| pane["pane_id"] == id.as_str())
         .ok_or("source missing")?;
-    spec.source = id;
-    Ok((pane, machine))
+    Ok((pane, machine, id))
+}
+
+/// Draws `text` as the reverse-video status bar on the last row.
+fn draw_bar(text: &str) {
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let width = usize::from(cols.max(1));
+    let mut text: String = text.chars().take(width).collect();
+    let used = text.chars().count();
+    text.extend(std::iter::repeat_n(' ', width - used));
+    // Save the cursor, draw on the last row, restore it.
+    write_out(format!("\x1b7\x1b[{};1H\x1b[0;7m{text}\x1b[0m\x1b8", rows.max(1)).as_bytes());
+}
+
+/// Whether a control stream ended because another client holds control, in
+/// which case the mirror stays view-only rather than fighting for it.
+fn control_refused(note: &str) -> bool {
+    note.contains("taken over") || note.contains("already has an attached client")
 }
 
 /// The report for a mirror whose source pane info is `source` (None if missing).
@@ -282,10 +404,11 @@ impl Mirror {
 
     fn event_loop(&mut self, inbox: &Receiver<Event>) -> Result<Exit, String> {
         self.label_pane();
-        write_out(b"\x1b[2J");
         self.start_observe();
         if self.spec.mode == Mode::Control {
-            self.start_control()?;
+            if let Err(err) = self.start_control() {
+                return Ok(Exit::Lost(err));
+            }
             spawn_layout_watcher(
                 Arc::clone(&self.geometry),
                 self.natural,
@@ -325,14 +448,22 @@ impl Mirror {
                     self.draw_status();
                 }
                 Ok(Event::ObserveEnded { generation, note }) if generation == self.generation => {
-                    self.note = note;
-                    self.draw_status();
+                    return Ok(Exit::Lost(note));
                 }
                 Ok(Event::Frame { .. } | Event::ObserveEnded { .. }) => {}
-                Ok(Event::ControlEnded(note)) => {
-                    self.note = note;
+                Ok(Event::ControlEnded(note)) if control_refused(&note) => {
+                    // Keep watching; another client drives the source now.
+                    if let Some((mut child, stdin)) = self.control.take() {
+                        drop(stdin);
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                    self.control_size = None;
+                    self.note = "another client has control · view-only".into();
                     self.draw_status();
                 }
+                Ok(Event::ControlEnded(note)) => return Ok(Exit::Lost(note)),
+                Ok(Event::SourceFound { .. } | Event::SourceLookupFailed(_)) => {}
                 Ok(Event::NaturalSize(size)) => {
                     self.natural = size;
                     self.apply_policy();
@@ -433,14 +564,7 @@ impl Mirror {
     }
 
     fn draw_status(&mut self) {
-        let size = self.mirror_size();
-        let width = usize::from(size.cols);
-        let mut text: String = self.status_line().chars().take(width).collect();
-        let used = text.chars().count();
-        text.extend(std::iter::repeat_n(' ', width - used));
-        // Save the cursor, draw in reverse video on the last row, restore it.
-        let bar = format!("\x1b7\x1b[{};1H\x1b[0;7m{text}\x1b[0m\x1b8", size.rows + 1);
-        write_out(bar.as_bytes());
+        draw_bar(&self.status_line());
     }
 
     fn label_pane(&self) {
@@ -454,8 +578,8 @@ impl Mirror {
     fn start_observe(&mut self) {
         let size = self.mirror_size();
         let previous = self.observe.take();
-        self.generation += 1;
-        let generation = self.generation;
+        let generation = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
+        self.generation = generation;
         let spawned = herdr::stream_command(
             StreamKind::Observe,
             &self.spec.source,
@@ -579,10 +703,12 @@ fn pump_observe(
             }
         }
     }
-    let detail = closed_reason.or_else(|| last_line(stderr));
-    let note = match detail {
-        Some(detail) => format!("source closed: {detail}"),
-        None => "source closed".into(),
+    // herdr says why when it closes a stream; a stream that just stops lost
+    // its connection.
+    let note = match (closed_reason, last_line(stderr)) {
+        (Some(reason), _) => format!("source closed: {reason}"),
+        (None, Some(detail)) => format!("connection lost: {detail}"),
+        (None, None) => "connection lost".into(),
     };
     let _ = events.send(Event::ObserveEnded { generation, note });
 }
@@ -756,5 +882,23 @@ mod tests {
             MirrorSpec::from_tokens(&Value::Object(tokens)),
             Some(spec())
         );
+    }
+
+    #[test]
+    fn retries_back_off_and_cap() {
+        let delays: Vec<u64> = (0..7).map(|n| retry_delay(n).as_secs()).collect();
+        assert_eq!(delays, [1, 2, 4, 8, 15, 15, 15]);
+    }
+
+    #[test]
+    fn losing_control_to_another_client_is_not_a_lost_connection() {
+        assert!(control_refused("input lost: terminal attach taken over"));
+        assert!(control_refused(
+            "input lost: terminal attach failed: terminal term_1 already has an attached client; retry with --takeover"
+        ));
+        assert!(!control_refused(
+            "input lost: Timeout, server ziggy not responding"
+        ));
+        assert!(!control_refused("input lost"));
     }
 }
