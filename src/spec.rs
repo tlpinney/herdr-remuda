@@ -90,12 +90,17 @@ impl MirrorSpec {
         if let Some(mode) = env("REMUDA_MODE") {
             spec.mode = parse_mode(&mode)?;
         }
-        if let Some(size) = env("REMUDA_SIZE") {
+        let size = env("REMUDA_SIZE");
+        if let Some(size) = &size {
             spec.size = size.parse()?;
         }
         spec.apply_args(args)?;
         if spec.source.is_empty() {
             return Err("no source pane: pass --source or set REMUDA_SOURCE".into());
+        }
+        let size_chosen = size.is_some() || args.iter().any(|arg| arg == "--size");
+        if !size_chosen {
+            spec.size = default_size(spec.mode);
         }
         Ok(spec)
     }
@@ -251,6 +256,15 @@ fn token_value(value: &str) -> String {
     value.trim().to_string()
 }
 
+/// The size policy when none is chosen: a mirror you drive sets the source's
+/// size, while a view-only mirror leaves it alone (observing never resizes).
+pub fn default_size(mode: Mode) -> Policy {
+    match mode {
+        Mode::View => Policy::Source,
+        Mode::Control => Policy::Follow,
+    }
+}
+
 fn parse_mode(value: &str) -> Result<Mode, String> {
     match value {
         "view" => Ok(Mode::View),
@@ -333,6 +347,20 @@ mod tests {
                 ..Hints::default()
             },
         }
+    }
+
+    #[test]
+    fn control_mirrors_follow_by_default_and_view_mirrors_keep_the_source_size() {
+        let args = |list: &[&str]| list.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        let control =
+            MirrorSpec::from_args_or_env(&args(&["--source", "w1:p1", "--mode", "control"]));
+        assert_eq!(control.unwrap().size, Policy::Follow);
+        let view = MirrorSpec::from_args_or_env(&args(&["--source", "w1:p1"]));
+        assert_eq!(view.unwrap().size, Policy::Source);
+        let chosen = MirrorSpec::from_args_or_env(&args(&[
+            "--source", "w1:p1", "--mode", "control", "--size", "freeze",
+        ]));
+        assert_eq!(chosen.unwrap().size, Policy::Freeze);
     }
 
     #[test]

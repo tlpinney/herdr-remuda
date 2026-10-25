@@ -82,12 +82,37 @@ pub fn socket_request(method: &str, _params: Value) -> Result<Value, String> {
 
 /// Runs a herdr CLI command for its side effect, ignoring the result.
 pub fn run_quietly(args: &[&str]) {
-    let _ = Command::new(bin())
+    run_quietly_on(None, args);
+}
+
+/// Like `run_quietly`, on a saved machine when `machine` is set.
+pub fn run_quietly_on(machine: Option<&str>, args: &[&str]) {
+    let _ = run_on(machine, args);
+}
+
+/// Runs a herdr CLI command that prints nothing on success (such as the
+/// `report-*` commands), on a saved machine when `machine` is set.
+pub fn run_on(machine: Option<&str>, args: &[&str]) -> Result<(), String> {
+    let mut command = Command::new(bin());
+    if let Some(machine) = machine {
+        command.args(["--machine", machine]);
+    }
+    let output = command
         .args(args)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+        .output()
+        .map_err(|err| format!("could not run herdr: {err}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if output.status.success() && !stdout.contains("\"error\"") {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let message = if stderr.trim().is_empty() {
+        stdout
+    } else {
+        stderr
+    };
+    Err(format!("herdr {}: {}", args.join(" "), message.trim()))
 }
 
 #[derive(Debug, Clone, Deserialize)]

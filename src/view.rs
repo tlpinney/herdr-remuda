@@ -16,8 +16,10 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use serde_json::{json, Value};
 
+use crate::config::Config;
 use crate::geometry::{Size, SourceGeometry};
 use crate::herdr::{self, Machine, StreamKind, MARK};
+use crate::presence::{self, Presence};
 use crate::report::{self, Report, Reporter};
 use crate::spec::{self, Hints, MirrorSpec, Mode};
 
@@ -56,6 +58,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let screen = Screen::enter()?;
     let mut reporter = Reporter::start();
     let resumable = on_path("remuda");
+    let mut presence = None;
 
     let outcome = match wait_for_source(&mut spec, &inbox, &mut reporter, resumable) {
         Ok(Waited::Found { pane, machine }) => {
@@ -65,6 +68,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
                     let exit = mirror.event_loop(&inbox);
                     mirror.stop_streams();
                     reporter = mirror.reporter.take();
+                    presence = mirror.presence.take();
                     exit
                 },
             )
@@ -74,6 +78,11 @@ pub fn run(args: &[String]) -> Result<(), String> {
         Err(err) => Err(err),
     };
     drop(screen);
+    // However the mirror ended, it no longer watches the source. A resumed
+    // mirror marks it again.
+    if let Some(presence) = presence {
+        presence.clear();
+    }
     if let (Ok(Exit::Quit), Some(reporter)) = (&outcome, reporter) {
         reporter.release();
     }
@@ -218,6 +227,9 @@ struct Mirror {
     note: String,
     reporter: Option<Reporter>,
     resumable: bool,
+    presence: Option<Presence>,
+    /// The source agent last marked, and when, to pace refreshes.
+    presence_mark: Option<(Option<String>, Instant)>,
 }
 
 impl Mirror {
@@ -230,7 +242,19 @@ impl Mirror {
         resumable: bool,
     ) -> Result<Mirror, String> {
         let geometry = SourceGeometry::new(&spec.source, spec.machine.as_deref())?;
-        let note = if resumable || reporter.is_none() {
+        let (config, config_error) = match Config::load() {
+            Ok(config) => (config, None),
+            Err(err) => (Config::default(), Some(err)),
+        };
+        let presence = Presence::start(
+            &spec.source,
+            spec.machine.as_deref(),
+            &config.machine_name(),
+            spec.mode,
+        );
+        let note = if let Some(err) = config_error {
+            err
+        } else if resumable || reporter.is_none() {
             String::new()
         } else {
             "run `remuda install` to keep mirrors across restarts".into()
@@ -249,6 +273,8 @@ impl Mirror {
             note,
             reporter,
             resumable,
+            presence: Some(presence),
+            presence_mark: None,
         };
         mirror.report(Some(source));
         Ok(mirror)
@@ -348,6 +374,29 @@ impl Mirror {
         let report = mirror_report(&self.spec, source, self.resumable);
         if let Some(reporter) = &mut self.reporter {
             reporter.report(report);
+        }
+        if let Some(source) = source {
+            self.mark_source(source);
+        }
+    }
+
+    /// Marks the source as mirrored when its agent changes, and refreshes the
+    /// mark before its TTL runs out.
+    fn mark_source(&mut self, source: &Value) {
+        let Some(presence) = &self.presence else {
+            return;
+        };
+        let agent = source["agent"]
+            .as_str()
+            .filter(|agent| !agent.is_empty())
+            .map(str::to_string);
+        let due = match &self.presence_mark {
+            None => true,
+            Some((marked, at)) => *marked != agent || at.elapsed() >= presence::REFRESH,
+        };
+        if due {
+            presence.show(agent.clone());
+            self.presence_mark = Some((agent, Instant::now()));
         }
     }
 

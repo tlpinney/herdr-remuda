@@ -8,11 +8,13 @@
 //!   install [--quiet]        put remuda on PATH so herdr can resume mirrors
 //!   views list|open <name>|delete <name>
 
+mod config;
 mod context;
 mod geometry;
 mod herdr;
 mod install;
 mod pick;
+mod presence;
 mod report;
 mod save;
 mod spec;

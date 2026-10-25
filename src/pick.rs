@@ -51,10 +51,11 @@ pub fn run() -> Result<(), String> {
         );
     });
     let (candidates, errors) = collect_candidates();
+    // The policy only applies to control mirrors (`c`), so start from theirs.
     let policy = std::env::var("REMUDA_SIZE")
         .ok()
         .and_then(|name| name.parse().ok())
-        .unwrap_or_default();
+        .unwrap_or(crate::spec::default_size(Mode::Control));
     let mut picker = Picker {
         candidates,
         views: views::list(),
