@@ -48,6 +48,38 @@ pub fn json(args: &[&str], machine: Option<&str>) -> Result<Value, String> {
     })
 }
 
+/// Sends one request over herdr's API socket, for methods the CLI lacks
+/// (`layout.export`, `layout.apply`).
+#[cfg(unix)]
+pub fn socket_request(method: &str, params: Value) -> Result<Value, String> {
+    use std::io::{BufRead, BufReader, Write};
+
+    let path = std::env::var("HERDR_SOCKET_PATH")
+        .map_err(|_| "HERDR_SOCKET_PATH is not set; run this inside herdr".to_string())?;
+    let mut stream = std::os::unix::net::UnixStream::connect(&path)
+        .map_err(|err| format!("connect to herdr at {path}: {err}"))?;
+    let request = serde_json::json!({"id": "remuda", "method": method, "params": params});
+    writeln!(stream, "{request}").map_err(|err| format!("{method}: {err}"))?;
+    let mut line = String::new();
+    BufReader::new(stream)
+        .read_line(&mut line)
+        .map_err(|err| format!("{method}: {err}"))?;
+    let mut response: Value =
+        serde_json::from_str(&line).map_err(|err| format!("{method}: invalid response: {err}"))?;
+    if let Some(error) = response.get("error") {
+        let message = error["message"].as_str().unwrap_or("unknown error");
+        return Err(format!("{method}: {message}"));
+    }
+    Ok(response["result"].take())
+}
+
+#[cfg(not(unix))]
+pub fn socket_request(method: &str, _params: Value) -> Result<Value, String> {
+    Err(format!(
+        "{method}: the herdr socket is only supported on unix"
+    ))
+}
+
 /// Runs a herdr CLI command for its side effect, ignoring the result.
 pub fn run_quietly(args: &[&str]) {
     let _ = Command::new(bin())

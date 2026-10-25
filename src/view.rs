@@ -16,51 +16,17 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use serde_json::{json, Value};
 
-use crate::geometry::{Policy, Size, SourceGeometry};
+use crate::geometry::{Size, SourceGeometry};
 use crate::herdr::{self, Machine, StreamKind, MARK};
+use crate::report::{self, Report, Reporter};
+use crate::spec::{self, Hints, MirrorSpec, Mode};
 
 const DETACH: u8 = 0x1d; // ctrl+]
 const LAYOUT_POLL: Duration = Duration::from_secs(1);
+const STATUS_POLL: Duration = Duration::from_secs(2);
+const SOURCE_RETRY: Duration = Duration::from_secs(5);
 const RESIZE_SETTLE: Duration = Duration::from_millis(50);
 const IDLE_TICK: Duration = Duration::from_millis(200);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode {
-    View,
-    Control,
-}
-
-/// What a mirror pane shows and how it drives its source, read from `REMUDA_*`.
-pub struct Config {
-    pub source: String,
-    pub machine: Option<String>,
-    pub mode: Mode,
-    pub policy: Policy,
-    pub takeover: bool,
-}
-
-impl Config {
-    pub fn from_env() -> Result<Self, String> {
-        let var = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
-        let source = var("REMUDA_SOURCE").ok_or("REMUDA_SOURCE is not set")?;
-        let mode = match var("REMUDA_MODE").as_deref() {
-            None | Some("view") => Mode::View,
-            Some("control") => Mode::Control,
-            Some(other) => return Err(format!("REMUDA_MODE must be view or control, not {other}")),
-        };
-        let policy = match var("REMUDA_SIZE") {
-            Some(name) => name.parse()?,
-            None => Policy::Source,
-        };
-        Ok(Self {
-            source,
-            machine: var("REMUDA_MACHINE"),
-            mode,
-            policy,
-            takeover: var("REMUDA_TAKEOVER").as_deref() == Some("1"),
-        })
-    }
-}
 
 enum Event {
     Input(Vec<u8>),
@@ -70,38 +36,176 @@ enum Event {
     ObserveEnded { generation: u64, note: String },
     ControlEnded(String),
     NaturalSize(Size),
+    SourceInfo(Value),
+    SourceMissing(String),
 }
 
-pub fn run() -> Result<(), String> {
-    let config = Config::from_env()?;
-    let machine = match config.machine.as_deref() {
+/// How the mirror ended.
+enum Exit {
+    /// The user quit with ctrl+]: release the pane.
+    Quit,
+    /// The pane closed under us, e.g. at server shutdown: keep the resume command.
+    Closed,
+}
+
+pub fn run(args: &[String]) -> Result<(), String> {
+    let mut spec = MirrorSpec::from_args_or_env(args)?;
+    let (events, inbox) = mpsc::channel();
+    spawn_input_reader(events.clone());
+    spawn_resize_watcher(events.clone())?;
+    let screen = Screen::enter()?;
+    let mut reporter = Reporter::start();
+    let resumable = on_path("remuda");
+
+    let outcome = match wait_for_source(&mut spec, &inbox, &mut reporter, resumable) {
+        Ok(Waited::Found { pane, machine }) => {
+            spec.hints = Hints::from_pane(&pane);
+            Mirror::new(spec, machine, &pane, events, reporter.take(), resumable).and_then(
+                |mut mirror| {
+                    let exit = mirror.event_loop(&inbox);
+                    mirror.stop_streams();
+                    reporter = mirror.reporter.take();
+                    exit
+                },
+            )
+        }
+        Ok(Waited::Quit) => Ok(Exit::Quit),
+        Ok(Waited::Closed) => Ok(Exit::Closed),
+        Err(err) => Err(err),
+    };
+    drop(screen);
+    if let (Ok(Exit::Quit), Some(reporter)) = (&outcome, reporter) {
+        reporter.release();
+    }
+    outcome.map(|_| ())
+}
+
+/// Raw mode and the alternate screen, restored on drop.
+struct Screen;
+
+impl Screen {
+    fn enter() -> Result<Screen, String> {
+        crossterm::terminal::enable_raw_mode().map_err(|err| format!("raw mode: {err}"))?;
+        write_out(b"\x1b[?1049h\x1b[2J");
+        Ok(Screen)
+    }
+}
+
+impl Drop for Screen {
+    fn drop(&mut self) {
+        write_out(b"\x1b[?1049l");
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
+fn write_out(bytes: &[u8]) {
+    let mut out = std::io::stdout();
+    let _ = out.write_all(bytes);
+    let _ = out.flush();
+}
+
+enum Waited {
+    Found {
+        pane: Value,
+        machine: Option<Machine>,
+    },
+    Quit,
+    Closed,
+}
+
+/// Finds the source, retrying while it is missing (after a restart, before a
+/// machine reconnects) and showing why. Updates `spec.source` if the pane was
+/// found again under a new id.
+fn wait_for_source(
+    spec: &mut MirrorSpec,
+    inbox: &Receiver<Event>,
+    reporter: &mut Option<Reporter>,
+    resumable: bool,
+) -> Result<Waited, String> {
+    loop {
+        let why = match find_source(spec) {
+            Ok((pane, machine)) => return Ok(Waited::Found { pane, machine }),
+            Err(why) => why,
+        };
+        if let Some(reporter) = reporter {
+            reporter.report(mirror_report(spec, None, resumable));
+        }
+        let draw = |why: &str| {
+            let (cols, _) = crossterm::terminal::size().unwrap_or((80, 24));
+            let line = format!(" {MARK} remuda · {} {} · {why}", spec.place(), spec.source);
+            let line: String = line.chars().take(usize::from(cols)).collect();
+            write_out(
+                format!(
+                    "\x1b[2J\x1b[H{line}\r\n\r\n retrying every {}s · ctrl+] quit",
+                    SOURCE_RETRY.as_secs()
+                )
+                .as_bytes(),
+            );
+        };
+        draw(&why);
+        let deadline = Instant::now() + SOURCE_RETRY;
+        loop {
+            match inbox.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(Event::Input(bytes)) if bytes.contains(&DETACH) => return Ok(Waited::Quit),
+                Ok(Event::InputClosed) | Err(RecvTimeoutError::Disconnected) => {
+                    return Ok(Waited::Closed)
+                }
+                Ok(Event::Resized) => draw(&why),
+                Ok(_) => {}
+                Err(RecvTimeoutError::Timeout) => break,
+            }
+        }
+    }
+}
+
+fn find_source(spec: &mut MirrorSpec) -> Result<(Value, Option<Machine>), String> {
+    let machine = match spec.machine.as_deref() {
         Some(label) => Some(
             herdr::machine_by_label(label)
-                .ok_or_else(|| format!("no enabled saved machine named {label:?}"))?,
+                .ok_or_else(|| format!("no enabled saved machine named {label}"))?,
         ),
         None => None,
     };
-    let geometry = SourceGeometry::new(&config.source, config.machine.as_deref())?;
-    let (events, inbox) = mpsc::channel();
-    let mut mirror = Mirror {
-        natural: geometry.initial,
-        geometry: Arc::new(geometry),
-        config,
-        machine,
-        events,
-        stop: Arc::new(AtomicBool::new(false)),
-        observe: None,
-        generation: 0,
-        control: None,
-        control_size: None,
-        note: String::new(),
-        out: std::io::stdout(),
+    let result = herdr::json(&["pane", "list"], spec.machine.as_deref())?;
+    let panes = result["panes"].as_array().cloned().unwrap_or_default();
+    let id = spec::resolve_source(spec, &panes).ok_or("source missing")?;
+    let pane = panes
+        .into_iter()
+        .find(|pane| pane["pane_id"] == id.as_str())
+        .ok_or("source missing")?;
+    spec.source = id;
+    Ok((pane, machine))
+}
+
+/// The report for a mirror whose source pane info is `source` (None if missing).
+fn mirror_report(spec: &MirrorSpec, source: Option<&Value>, resumable: bool) -> Report {
+    let agent = source
+        .and_then(|pane| pane["agent"].as_str())
+        .filter(|a| !a.is_empty());
+    let state = match (agent, source) {
+        (Some(_), Some(pane)) => report::report_state(pane["agent_status"].as_str().unwrap_or("")),
+        _ => "idle",
     };
-    mirror.run(inbox)
+    let display = match agent {
+        Some(agent) => format!("{MARK} {agent}@{}", spec.place()),
+        None => format!("{MARK} {}:{}", spec.place(), spec.source),
+    };
+    Report {
+        state,
+        display,
+        tokens: spec.to_tokens(),
+        resume: if resumable { spec.resume_argv() } else { None },
+    }
+}
+
+/// Whether `name` is an executable on PATH, which herdr requires of a resume command.
+fn on_path(name: &str) -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).is_file()))
 }
 
 struct Mirror {
-    config: Config,
+    spec: MirrorSpec,
     machine: Option<Machine>,
     geometry: Arc<SourceGeometry>,
     natural: Size,
@@ -112,24 +216,49 @@ struct Mirror {
     control: Option<(Child, ChildStdin)>,
     control_size: Option<Size>,
     note: String,
-    out: std::io::Stdout,
+    reporter: Option<Reporter>,
+    resumable: bool,
 }
 
 impl Mirror {
-    fn run(&mut self, inbox: Receiver<Event>) -> Result<(), String> {
-        self.label_pane();
-        crossterm::terminal::enable_raw_mode().map_err(|err| format!("raw mode: {err}"))?;
-        self.write(b"\x1b[?1049h\x1b[2J");
-        let result = self.event_loop(inbox);
-        self.shutdown();
-        result
+    fn new(
+        spec: MirrorSpec,
+        machine: Option<Machine>,
+        source: &Value,
+        events: Sender<Event>,
+        reporter: Option<Reporter>,
+        resumable: bool,
+    ) -> Result<Mirror, String> {
+        let geometry = SourceGeometry::new(&spec.source, spec.machine.as_deref())?;
+        let note = if resumable || reporter.is_none() {
+            String::new()
+        } else {
+            "run `remuda install` to keep mirrors across restarts".into()
+        };
+        let mut mirror = Mirror {
+            natural: geometry.initial,
+            geometry: Arc::new(geometry),
+            spec,
+            machine,
+            events,
+            stop: Arc::new(AtomicBool::new(false)),
+            observe: None,
+            generation: 0,
+            control: None,
+            control_size: None,
+            note,
+            reporter,
+            resumable,
+        };
+        mirror.report(Some(source));
+        Ok(mirror)
     }
 
-    fn event_loop(&mut self, inbox: Receiver<Event>) -> Result<(), String> {
-        spawn_input_reader(self.events.clone());
-        spawn_resize_watcher(self.events.clone())?;
+    fn event_loop(&mut self, inbox: &Receiver<Event>) -> Result<Exit, String> {
+        self.label_pane();
+        write_out(b"\x1b[2J");
         self.start_observe();
-        if self.config.mode == Mode::Control {
+        if self.spec.mode == Mode::Control {
             self.start_control()?;
             spawn_layout_watcher(
                 Arc::clone(&self.geometry),
@@ -138,6 +267,12 @@ impl Mirror {
                 Arc::clone(&self.stop),
             );
         }
+        spawn_status_watcher(
+            self.spec.source.clone(),
+            self.spec.machine.clone(),
+            self.events.clone(),
+            Arc::clone(&self.stop),
+        );
 
         let mut resize_due: Option<Instant> = None;
         loop {
@@ -147,19 +282,20 @@ impl Mirror {
             match inbox.recv_timeout(timeout) {
                 Ok(Event::Input(bytes)) => {
                     if bytes.contains(&DETACH) {
-                        return Ok(());
+                        return Ok(Exit::Quit);
                     }
-                    if self.config.mode == Mode::Control {
+                    if self.spec.mode == Mode::Control {
                         let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
                         self.send_control(json!({"type": "terminal.input", "bytes": data}));
                     }
                 }
-                Ok(Event::InputClosed) => return Ok(()),
+                Ok(Event::InputClosed) | Err(RecvTimeoutError::Disconnected) => {
+                    return Ok(Exit::Closed)
+                }
                 // A window drag sends a burst of these; act once it settles.
                 Ok(Event::Resized) => resize_due = Some(Instant::now() + RESIZE_SETTLE),
                 Ok(Event::Frame { generation, bytes }) if generation == self.generation => {
-                    self.write(&bytes);
-                    self.note.clear();
+                    write_out(&bytes);
                     self.draw_status();
                 }
                 Ok(Event::ObserveEnded { generation, note }) if generation == self.generation => {
@@ -175,8 +311,16 @@ impl Mirror {
                     self.natural = size;
                     self.apply_policy();
                 }
+                Ok(Event::SourceInfo(pane)) => {
+                    self.spec.hints = Hints::from_pane(&pane);
+                    self.report(Some(&pane));
+                }
+                Ok(Event::SourceMissing(why)) => {
+                    self.note = why;
+                    self.report(None);
+                    self.draw_status();
+                }
                 Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => return Ok(()),
             }
             if resize_due.is_some_and(|due| Instant::now() >= due) {
                 resize_due = None;
@@ -186,7 +330,7 @@ impl Mirror {
         }
     }
 
-    fn shutdown(&mut self) {
+    fn stop_streams(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         self.send_control(json!({"type": "terminal.release"}));
         if let Some(mut child) = self.observe.take() {
@@ -198,8 +342,13 @@ impl Mirror {
             let _ = child.kill();
             let _ = child.wait();
         }
-        self.write(b"\x1b[?1049l");
-        let _ = crossterm::terminal::disable_raw_mode();
+    }
+
+    fn report(&mut self, source: Option<&Value>) {
+        let report = mirror_report(&self.spec, source, self.resumable);
+        if let Some(reporter) = &mut self.reporter {
+            reporter.report(report);
+        }
     }
 
     /// This pane's size, less the status bar row.
@@ -211,24 +360,19 @@ impl Mirror {
         }
     }
 
-    fn write(&mut self, bytes: &[u8]) {
-        let _ = self.out.write_all(bytes);
-        let _ = self.out.flush();
-    }
-
     fn status_line(&self) -> String {
-        let place = self.config.machine.as_deref().unwrap_or("local");
-        let mut line = format!(" {MARK} remuda · {place} {}", self.config.source);
-        match self.config.mode {
+        let mut line = format!(
+            " {MARK} remuda · {} {}",
+            self.spec.place(),
+            self.spec.source
+        );
+        match self.spec.mode {
             Mode::View => line.push_str(" · view-only"),
             Mode::Control => {
                 line.push_str(" · control");
                 if let Some(size) = self.control_size {
                     let approx = if self.geometry.estimated { "~" } else { "" };
-                    line.push_str(&format!(
-                        " · {} {approx}{size}",
-                        self.config.policy.as_str()
-                    ));
+                    line.push_str(&format!(" · {} {approx}{size}", self.spec.size.as_str()));
                 }
             }
         }
@@ -247,15 +391,14 @@ impl Mirror {
         text.extend(std::iter::repeat_n(' ', width - used));
         // Save the cursor, draw in reverse video on the last row, restore it.
         let bar = format!("\x1b7\x1b[{};1H\x1b[0;7m{text}\x1b[0m\x1b8", size.rows + 1);
-        self.write(bar.as_bytes());
+        write_out(bar.as_bytes());
     }
 
     fn label_pane(&self) {
         let Ok(pane_id) = std::env::var("HERDR_PANE_ID") else {
             return;
         };
-        let place = self.config.machine.as_deref().unwrap_or("local");
-        let label = format!("{MARK} {place}:{}", self.config.source);
+        let label = format!("{MARK} {}:{}", self.spec.place(), self.spec.source);
         herdr::run_quietly(&["pane", "rename", &pane_id, &label]);
     }
 
@@ -266,7 +409,7 @@ impl Mirror {
         let generation = self.generation;
         let spawned = herdr::stream_command(
             StreamKind::Observe,
-            &self.config.source,
+            &self.spec.source,
             size.cols,
             size.rows,
             self.machine.as_ref(),
@@ -300,11 +443,11 @@ impl Mirror {
         let size = self.target_size();
         let mut child = herdr::stream_command(
             StreamKind::Control,
-            &self.config.source,
+            &self.spec.source,
             size.cols,
             size.rows,
             self.machine.as_ref(),
-            self.config.takeover,
+            self.spec.takeover,
         )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -334,13 +477,13 @@ impl Mirror {
     }
 
     fn target_size(&self) -> Size {
-        self.config
-            .policy
+        self.spec
+            .size
             .size(self.mirror_size(), self.natural, self.geometry.initial)
     }
 
     fn apply_policy(&mut self) {
-        if self.config.mode != Mode::Control {
+        if self.spec.mode != Mode::Control {
             return;
         }
         let size = self.target_size();
@@ -495,4 +638,74 @@ fn spawn_layout_watcher(
             }
         }
     });
+}
+
+/// Polls the source pane so the mirror's sidebar state and hints stay current.
+fn spawn_status_watcher(
+    source: String,
+    machine: Option<String>,
+    events: Sender<Event>,
+    stop: Arc<AtomicBool>,
+) {
+    thread::spawn(move || loop {
+        thread::sleep(STATUS_POLL);
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let event = match herdr::json(&["pane", "get", &source], machine.as_deref()) {
+            Ok(mut result) => Event::SourceInfo(result["pane"].take()),
+            Err(err) if err.contains("not found") => Event::SourceMissing("source missing".into()),
+            // A transient failure (a remote reconnecting) is not news.
+            Err(_) => continue,
+        };
+        if events.send(event).is_err() {
+            return;
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec() -> MirrorSpec {
+        MirrorSpec {
+            source: "w8:p1".into(),
+            machine: Some("ziggy".into()),
+            ..MirrorSpec::default()
+        }
+    }
+
+    #[test]
+    fn report_mirrors_an_agent_source() {
+        let pane = json!({"agent": "claude", "agent_status": "working"});
+        let report = mirror_report(&spec(), Some(&pane), true);
+        assert_eq!(report.state, "working");
+        assert_eq!(report.display, "\u{21c4} claude@ziggy");
+        assert_eq!(report.resume.unwrap()[..2], ["remuda", "view"]);
+    }
+
+    #[test]
+    fn report_for_a_shell_or_missing_source_is_idle() {
+        let shell = json!({"agent_status": "unknown"});
+        let report = mirror_report(&spec(), Some(&shell), false);
+        assert_eq!(report.state, "idle");
+        assert_eq!(report.display, "\u{21c4} ziggy:w8:p1");
+        assert_eq!(report.resume, None);
+        assert_eq!(mirror_report(&spec(), None, true).state, "idle");
+    }
+
+    #[test]
+    fn report_tokens_read_back_as_the_spec() {
+        let report = mirror_report(&spec(), None, true);
+        let tokens: serde_json::Map<String, Value> = report
+            .tokens
+            .into_iter()
+            .filter_map(|(key, value)| Some((key.to_string(), Value::String(value?))))
+            .collect();
+        assert_eq!(
+            MirrorSpec::from_tokens(&Value::Object(tokens)),
+            Some(spec())
+        );
+    }
 }

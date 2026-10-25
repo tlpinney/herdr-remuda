@@ -3,6 +3,7 @@
 use std::fmt;
 use std::str::FromStr;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::herdr;
@@ -19,9 +20,11 @@ impl fmt::Display for Size {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Policy {
     /// The source keeps the size its own layout gives it.
+    #[default]
     Source,
     /// The source follows this mirror's size.
     Follow,
