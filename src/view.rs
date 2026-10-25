@@ -19,6 +19,7 @@ use serde_json::{json, Value};
 use crate::config::Config;
 use crate::geometry::{Size, SourceGeometry};
 use crate::herdr::{self, Machine, StreamKind, MARK};
+use crate::input;
 use crate::presence::{self, Presence};
 use crate::report::{self, Report, Reporter};
 use crate::spec::{self, Hints, MirrorSpec, Mode};
@@ -28,6 +29,10 @@ const LAYOUT_POLL: Duration = Duration::from_secs(1);
 const STATUS_POLL: Duration = Duration::from_secs(2);
 const RESIZE_SETTLE: Duration = Duration::from_millis(50);
 const IDLE_TICK: Duration = Duration::from_millis(200);
+/// How long input may pause mid-sequence before held bytes count as keys.
+const INPUT_PAUSE: Duration = Duration::from_millis(25);
+/// Lines per wheel step, herdr's default `mouse_scroll_lines`.
+const WHEEL_LINES: u16 = 3;
 
 /// Stream generations are unique for the whole process, so a frame from a
 /// stream that belonged to an earlier connection is never drawn.
@@ -145,6 +150,7 @@ impl Screen {
 
 impl Drop for Screen {
     fn drop(&mut self) {
+        write_out(input::MOUSE_OFF);
         write_out(b"\x1b[?1049l");
         let _ = crossterm::terminal::disable_raw_mode();
     }
@@ -409,6 +415,9 @@ impl Mirror {
             if let Err(err) = self.start_control() {
                 return Ok(Exit::Lost(err));
             }
+            // Ask for real mouse events; otherwise herdr turns the wheel into
+            // arrow keys, which an agent's prompt reads as input history.
+            write_out(input::MOUSE_ON);
             spawn_layout_watcher(
                 Arc::clone(&self.geometry),
                 self.natural,
@@ -424,18 +433,32 @@ impl Mirror {
         );
 
         let mut resize_due: Option<Instant> = None;
+        let mut parser = input::Parser::default();
         loop {
-            let timeout = resize_due
+            let mut timeout = resize_due
                 .map(|due| due.saturating_duration_since(Instant::now()))
                 .unwrap_or(IDLE_TICK);
+            if parser.holding() {
+                timeout = timeout.min(INPUT_PAUSE);
+            }
             match inbox.recv_timeout(timeout) {
                 Ok(Event::Input(bytes)) => {
                     if bytes.contains(&DETACH) {
                         return Ok(Exit::Quit);
                     }
-                    if self.spec.mode == Mode::Control {
-                        let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                        self.send_control(json!({"type": "terminal.input", "bytes": data}));
+                    if self.control.is_some() {
+                        for piece in parser.feed(&bytes) {
+                            match piece {
+                                input::Piece::Keys(keys) => self.send_keys(&keys),
+                                input::Piece::Mouse(mouse) => self.send_mouse(mouse),
+                            }
+                        }
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) if parser.holding() => {
+                    // Input paused mid-sequence: it was a key (Escape), not a mouse event.
+                    if let Some(keys) = parser.flush() {
+                        self.send_keys(&keys);
                     }
                 }
                 Ok(Event::InputClosed) | Err(RecvTimeoutError::Disconnected) => {
@@ -459,6 +482,7 @@ impl Mirror {
                         let _ = child.wait();
                     }
                     self.control_size = None;
+                    write_out(input::MOUSE_OFF);
                     self.note = "another client has control · view-only".into();
                     self.draw_status();
                 }
@@ -565,6 +589,55 @@ impl Mirror {
 
     fn draw_status(&mut self) {
         draw_bar(&self.status_line());
+    }
+
+    fn send_keys(&mut self, keys: &[u8]) {
+        let data = base64::engine::general_purpose::STANDARD.encode(keys);
+        self.send_control(json!({"type": "terminal.input", "bytes": data}));
+    }
+
+    /// Forwards a mouse event to the source when it lands on the source's
+    /// cells: the wheel scrolls it as herdr would, and clicks reach apps that
+    /// enabled mouse reporting (herdr drops them otherwise).
+    fn send_mouse(&mut self, mouse: input::Mouse) {
+        let Some(size) = self.control_size else {
+            return;
+        };
+        // The status bar, or space past the source's edge.
+        if mouse.row >= self.mirror_size().rows
+            || mouse.column >= size.cols
+            || mouse.row >= size.rows
+        {
+            return;
+        }
+        let message = match mouse.action {
+            input::MouseAction::WheelUp | input::MouseAction::WheelDown => json!({
+                "type": "terminal.scroll",
+                "direction": if mouse.action == input::MouseAction::WheelUp { "up" } else { "down" },
+                "lines": WHEEL_LINES,
+                "source": "wheel",
+                "column": mouse.column,
+                "row": mouse.row,
+                "modifiers": mouse.modifiers,
+            }),
+            action => {
+                let (name, button) = match action {
+                    input::MouseAction::Down(button) => ("down", button),
+                    input::MouseAction::Up(button) => ("up", button),
+                    input::MouseAction::Drag(button) => ("drag", button),
+                    _ => ("move", input::Button::Left),
+                };
+                json!({
+                    "type": "terminal.mouse",
+                    "action": name,
+                    "button": button.as_str(),
+                    "column": mouse.column,
+                    "row": mouse.row,
+                    "modifiers": mouse.modifiers,
+                })
+            }
+        };
+        self.send_control(message);
     }
 
     fn label_pane(&self) {

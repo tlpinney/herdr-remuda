@@ -12,6 +12,7 @@ mod config;
 mod context;
 mod geometry;
 mod herdr;
+mod input;
 mod install;
 mod pick;
 mod presence;
