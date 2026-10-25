@@ -1,0 +1,29 @@
+id = "remuda"
+name = "Remuda"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "Pick panes from any machine into a view of your own: live mirrors with selectable resize policies"
+platforms = ["linux", "macos"]
+
+[[build]]
+command = ["cargo", "build", "--release", "--locked"]
+
+[[actions]]
+id = "pick"
+title = "Mirror a pane"
+contexts = ["workspace"]
+command = ["target/release/remuda", "open-picker"]
+
+[[panes]]
+id = "pick"
+title = "Mirror a pane"
+placement = "popup"
+width = "80%"
+height = "70%"
+command = ["target/release/remuda", "pick"]
+
+[[panes]]
+id = "view"
+title = "Remuda"
+placement = "split"
+command = ["target/release/remuda", "view"]
