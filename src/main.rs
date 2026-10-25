@@ -15,6 +15,7 @@ mod herdr;
 mod install;
 mod pick;
 mod presence;
+mod remote;
 mod report;
 mod save;
 mod spec;

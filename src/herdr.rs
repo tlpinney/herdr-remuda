@@ -1,9 +1,14 @@
 //! Access to herdr through its CLI, locally or on a saved SSH machine.
 
+use std::collections::HashMap;
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::Value;
+
+use crate::remote::Remote;
 
 pub const MARK: &str = "\u{21c4}"; // ⇄
 
@@ -15,17 +20,35 @@ pub fn plugin_id() -> String {
     std::env::var("HERDR_PLUGIN_ID").unwrap_or_else(|_| "remuda".into())
 }
 
-/// Runs a herdr CLI command and returns its `result` object.
-pub fn json(args: &[&str], machine: Option<&str>) -> Result<Value, String> {
-    let mut command = Command::new(bin());
-    if let Some(machine) = machine {
-        command.args(["--machine", machine]);
-    }
-    let output = command
-        .args(args)
+/// Runs a herdr CLI command, locally or on the saved machine `machine`.
+///
+/// Remote commands go through the machine's shared SSH connection, falling
+/// back to `herdr --machine` when it is unavailable.
+fn output(args: &[&str], machine: Option<&str>) -> Result<std::process::Output, String> {
+    let mut command = match machine {
+        None => {
+            let mut command = Command::new(bin());
+            command.args(args);
+            command
+        }
+        Some(label) => match cached_machine(label).map(|machine| Remote::new(&machine)) {
+            Some(remote) if remote.connection_ready() => remote.herdr_command(args),
+            _ => {
+                let mut command = Command::new(bin());
+                command.args(["--machine", label]).args(args);
+                command
+            }
+        },
+    };
+    command
         .stdin(Stdio::null())
         .output()
-        .map_err(|err| format!("could not run herdr: {err}"))?;
+        .map_err(|err| format!("could not run herdr: {err}"))
+}
+
+/// Runs a herdr CLI command and returns its `result` object.
+pub fn json(args: &[&str], machine: Option<&str>) -> Result<Value, String> {
+    let output = output(args, machine)?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -93,15 +116,7 @@ pub fn run_quietly_on(machine: Option<&str>, args: &[&str]) {
 /// Runs a herdr CLI command that prints nothing on success (such as the
 /// `report-*` commands), on a saved machine when `machine` is set.
 pub fn run_on(machine: Option<&str>, args: &[&str]) -> Result<(), String> {
-    let mut command = Command::new(bin());
-    if let Some(machine) = machine {
-        command.args(["--machine", machine]);
-    }
-    let output = command
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|err| format!("could not run herdr: {err}"))?;
+    let output = output(args, machine)?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     if output.status.success() && !stdout.contains("\"error\"") {
         return Ok(());
@@ -147,6 +162,25 @@ pub fn machine_by_label(label: &str) -> Option<Machine> {
         .find(|machine| machine.label == label || machine.id == label)
 }
 
+/// `machine_by_label`, remembered for a minute: remote calls look up their
+/// machine on every poll, and the catalog rarely changes.
+fn cached_machine(label: &str) -> Option<Machine> {
+    type Cache = HashMap<String, (Instant, Option<Machine>)>;
+    static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some((at, machine)) = cache.lock().ok()?.get(label) {
+        if at.elapsed() < Duration::from_secs(60) {
+            return machine.clone();
+        }
+    }
+    let machine = machine_by_label(label);
+    cache
+        .lock()
+        .ok()?
+        .insert(label.to_string(), (Instant::now(), machine.clone()));
+    machine
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamKind {
     Observe,
@@ -156,7 +190,8 @@ pub enum StreamKind {
 /// Builds the command for a `terminal session` stream.
 ///
 /// `--machine` does not forward interactive streams, so remote streams run the
-/// remote herdr over plain ssh against the machine's saved target and session.
+/// remote herdr over ssh against the machine's saved target and session,
+/// through its shared connection when that is up.
 pub fn stream_command(
     kind: StreamKind,
     source: &str,
@@ -190,78 +225,8 @@ pub fn stream_command(
             command
         }
         Some(machine) => {
-            let remote_herdr =
-                std::env::var("REMUDA_REMOTE_HERDR").unwrap_or_else(|_| "herdr".into());
-            let mut remote = vec![remote_herdr];
-            if let Some(session) = machine.session.as_deref().filter(|s| *s != "default") {
-                remote.push("--session".into());
-                remote.push(session.into());
-            }
-            remote.extend(args);
-            let script = remote
-                .iter()
-                .map(|arg| shell_quote(arg))
-                .collect::<Vec<_>>()
-                .join(" ");
-            let mut command = Command::new("ssh");
-            command.args([
-                "-T",
-                "-o",
-                "ServerAliveInterval=15",
-                &machine.target,
-                &format!("exec {script}"),
-            ]);
-            command
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            Remote::new(machine).herdr_command(&args)
         }
-    }
-}
-
-fn shell_quote(arg: &str) -> String {
-    let safe = !arg.is_empty()
-        && arg
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"-_./:=@%+,".contains(&b));
-    if safe {
-        arg.to_string()
-    } else {
-        format!("'{}'", arg.replace('\'', r"'\''"))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn shell_quote_leaves_plain_words_alone() {
-        assert_eq!(shell_quote("w1:p3"), "w1:p3");
-        assert_eq!(shell_quote("--cols"), "--cols");
-    }
-
-    #[test]
-    fn shell_quote_wraps_spaces_and_quotes() {
-        assert_eq!(shell_quote("a b"), "'a b'");
-        assert_eq!(shell_quote("it's"), r"'it'\''s'");
-        assert_eq!(shell_quote(""), "''");
-    }
-
-    #[test]
-    fn remote_stream_runs_remote_herdr_over_ssh_with_session() {
-        let machine = Machine {
-            id: "id".into(),
-            label: "ziggy".into(),
-            target: "ziggy".into(),
-            session: Some("agents".into()),
-            enabled: true,
-        };
-        let command = stream_command(StreamKind::Control, "w1:p3", 80, 24, Some(&machine), true);
-        let args: Vec<_> = command
-            .get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(command.get_program(), "ssh");
-        assert_eq!(args[3], "ziggy");
-        assert!(args[4].starts_with("exec herdr --session agents terminal session control w1:p3"));
-        assert!(args[4].ends_with("--rows 24 --takeover"));
     }
 }
