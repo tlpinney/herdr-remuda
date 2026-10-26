@@ -6,6 +6,15 @@
 //! through input history. Mouse events become `terminal.scroll` and
 //! `terminal.mouse` commands; everything else is forwarded as typed.
 //!
+//! Modified keys need help too. herdr's `terminal session` stream does not say
+//! which keyboard mode the source's app has enabled, so a mirror cannot match
+//! it, and with classic encoding Shift+Enter is indistinguishable from Enter;
+//! in an agent's prompt that submits instead of starting a new line. So the
+//! mirror asks for xterm modifyOtherKeys (level 2), under which herdr sends
+//! every modified key as `ESC [ 27 ; mod ; code ~`, and converts those back to
+//! classic keys for the source, sending Shift+Enter as Escape-Enter, which
+//! agents such as Claude Code read as a new line.
+//!
 //! A sequence split across reads is held until the rest arrives. A lone
 //! Escape looks like the start of one, so `flush` releases held bytes once
 //! input pauses; Escape is never swallowed.
@@ -14,6 +23,9 @@
 /// button held, and SGR coordinates.
 pub const MOUSE_ON: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 pub const MOUSE_OFF: &[u8] = b"\x1b[?1006l\x1b[?1002l\x1b[?1000l";
+/// modifyOtherKeys level 2 on and off.
+pub const MODIFIED_KEYS_ON: &[u8] = b"\x1b[>4;2m";
+pub const MODIFIED_KEYS_OFF: &[u8] = b"\x1b[>4;0m";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Button {
@@ -73,8 +85,9 @@ impl Parser {
         let mut i = 0;
         while i < data.len() {
             if data[i] == 0x1b {
-                match parse_sgr_mouse(&data[i..]) {
-                    Sgr::Complete(mouse, len) => {
+                let rest = &data[i..];
+                match (parse_sgr_mouse(rest), parse_modified_key(rest)) {
+                    (Seq::Complete(mouse, len), _) => {
                         flush_keys(&mut keys, &mut pieces);
                         if let Some(mouse) = mouse {
                             pieces.push(Piece::Mouse(mouse));
@@ -82,11 +95,16 @@ impl Parser {
                         i += len;
                         continue;
                     }
-                    Sgr::Partial => {
-                        self.pending = data[i..].to_vec();
+                    (_, Seq::Complete(key, len)) => {
+                        keys.extend(key.unwrap_or_default());
+                        i += len;
+                        continue;
+                    }
+                    (Seq::Partial, _) | (_, Seq::Partial) => {
+                        self.pending = rest.to_vec();
                         break;
                     }
-                    Sgr::NotMouse => {}
+                    (Seq::Other, Seq::Other) => {}
                 }
             }
             keys.push(data[i]);
@@ -112,49 +130,115 @@ fn flush_keys(keys: &mut Vec<u8>, pieces: &mut Vec<Piece>) {
     }
 }
 
-enum Sgr {
+enum Seq<T> {
     /// A whole sequence of this many bytes; `None` for one we ignore.
-    Complete(Option<Mouse>, usize),
-    /// Could still become a mouse sequence; wait for more bytes.
+    Complete(Option<T>, usize),
+    /// Could still become this kind of sequence; wait for more bytes.
     Partial,
-    NotMouse,
+    Other,
 }
 
-/// Parses `ESC [ < b ; x ; y (M|m)` at the start of `data`.
-fn parse_sgr_mouse(data: &[u8]) -> Sgr {
-    const PREFIX: &[u8] = b"\x1b[<";
-    let prefix_len = PREFIX.len().min(data.len());
-    if data[..prefix_len] != PREFIX[..prefix_len] {
-        return Sgr::NotMouse;
+/// Matches `prefix`, then digits and semicolons, then a terminator from
+/// `terminators`. Returns the numbers, the terminator and the length.
+fn parse_csi<T>(
+    data: &[u8],
+    prefix: &[u8],
+    terminators: &[u8],
+) -> Result<(Vec<u32>, u8, usize), Seq<T>> {
+    let prefix_len = prefix.len().min(data.len());
+    if data[..prefix_len] != prefix[..prefix_len] {
+        return Err(Seq::Other);
     }
-    if data.len() < PREFIX.len() {
-        return Sgr::Partial;
+    if data.len() < prefix.len() {
+        return Err(Seq::Partial);
     }
-    let body = &data[PREFIX.len()..];
+    let body = &data[prefix.len()..];
     let Some(end) = body
         .iter()
         .position(|b| !(b.is_ascii_digit() || *b == b';'))
     else {
         // Digits so far; a real sequence is short, so give up on runaway input.
-        return if body.len() < 24 {
-            Sgr::Partial
+        return Err(if body.len() < 24 {
+            Seq::Partial
         } else {
-            Sgr::NotMouse
-        };
+            Seq::Other
+        });
     };
-    let terminator = body[end];
-    if terminator != b'M' && terminator != b'm' {
-        return Sgr::NotMouse;
+    if !terminators.contains(&body[end]) {
+        return Err(Seq::Other);
     }
-    let numbers: Vec<u16> = body[..end]
+    let numbers = body[..end]
         .split(|b| *b == b';')
         .filter_map(|n| std::str::from_utf8(n).ok()?.parse().ok())
         .collect();
-    let len = PREFIX.len() + end + 1;
-    let [code, x, y] = numbers[..] else {
-        return Sgr::Complete(None, len);
-    };
-    Sgr::Complete(decode(code, x, y, terminator == b'm'), len)
+    Ok((numbers, body[end], prefix.len() + end + 1))
+}
+
+/// Parses `ESC [ < b ; x ; y (M|m)` at the start of `data`.
+fn parse_sgr_mouse(data: &[u8]) -> Seq<Mouse> {
+    match parse_csi(data, b"\x1b[<", b"Mm") {
+        Ok((numbers, terminator, len)) => match numbers[..] {
+            [code, x, y] => Seq::Complete(
+                decode(
+                    u16::try_from(code).unwrap_or(0),
+                    u16::try_from(x).unwrap_or(u16::MAX),
+                    u16::try_from(y).unwrap_or(u16::MAX),
+                    terminator == b'm',
+                ),
+                len,
+            ),
+            _ => Seq::Complete(None, len),
+        },
+        Err(seq) => seq,
+    }
+}
+
+/// Parses a modifyOtherKeys key, `ESC [ 27 ; mod ; code ~`, into the bytes a
+/// classic terminal sends for it.
+fn parse_modified_key(data: &[u8]) -> Seq<Vec<u8>> {
+    match parse_csi(data, b"\x1b[27;", b"~") {
+        Ok((numbers, _, len)) => match numbers[..] {
+            [modifier, code] => Seq::Complete(Some(classic_key(modifier, code)), len),
+            _ => Seq::Complete(None, len),
+        },
+        Err(seq) => seq,
+    }
+}
+
+/// What a classic terminal sends for key `code` with xterm modifier `modifier`
+/// (1 + Shift 1 + Alt 2 + Ctrl 4). Shift+Enter and Alt+Enter become
+/// Escape-Enter, the new-line key in agents' prompts.
+fn classic_key(modifier: u32, code: u32) -> Vec<u8> {
+    let bits = modifier.saturating_sub(1);
+    let (shift, alt, ctrl) = (bits & 1 != 0, bits & 2 != 0, bits & 4 != 0);
+    match code {
+        13 if shift || alt => return b"\x1b\r".to_vec(),
+        13 => return b"\r".to_vec(),
+        9 if shift => return b"\x1b[Z".to_vec(),
+        _ => {}
+    }
+    let mut out = Vec::new();
+    if alt {
+        out.push(0x1b);
+    }
+    match (code, char::from_u32(code)) {
+        (127, _) => out.push(if ctrl { 0x08 } else { 0x7f }),
+        (_, Some(c)) if ctrl => match c.to_ascii_uppercase() {
+            upper @ '@'..='_' => out.push(upper as u8 & 0x1f),
+            ' ' | '2' => out.push(0),
+            '?' => out.push(0x7f),
+            _ => push_char(&mut out, c),
+        },
+        (_, Some(c)) if shift && c.is_ascii_lowercase() => out.push(c.to_ascii_uppercase() as u8),
+        (_, Some(c)) => push_char(&mut out, c),
+        (_, None) => {}
+    }
+    out
+}
+
+fn push_char(out: &mut Vec<u8>, c: char) {
+    let mut buffer = [0; 4];
+    out.extend_from_slice(c.encode_utf8(&mut buffer).as_bytes());
 }
 
 fn decode(code: u16, x: u16, y: u16, release: bool) -> Option<Mouse> {
@@ -274,12 +358,40 @@ mod tests {
     }
 
     #[test]
+    fn modified_keys_become_classic_keys() {
+        let mut parser = Parser::default();
+        let keys = |pieces: Vec<Piece>| match &pieces[..] {
+            [Piece::Keys(keys)] => keys.clone(),
+            other => panic!("expected keys, got {other:?}"),
+        };
+        // Encodings captured from herdr with modifyOtherKeys level 2.
+        assert_eq!(keys(parser.feed(b"\x1b[27;2;13~")), b"\x1b\r");
+        assert_eq!(keys(parser.feed(b"\x1b[27;3;13~")), b"\x1b\r");
+        assert_eq!(keys(parser.feed(b"\x1b[27;5;13~")), b"\r");
+        assert_eq!(keys(parser.feed(b"\x1b[27;2;9~")), b"\x1b[Z");
+        assert_eq!(keys(parser.feed(b"\x1b[27;3;120~")), b"\x1bx");
+        assert_eq!(keys(parser.feed(b"\x1b[27;5;97~")), [0x01]);
+        assert_eq!(keys(parser.feed(b"\x1b[27;5;100~")), [0x04]);
+        assert_eq!(keys(parser.feed(b"\x1b[27;7;99~")), [0x1b, 0x03]);
+        assert_eq!(keys(parser.feed(b"\x1b[27;5;127~")), [0x08]);
+        assert_eq!(keys(parser.feed(b"\x1b[27;2;97~")), b"A");
+        assert!(!parser.holding());
+    }
+
+    #[test]
+    fn a_split_modified_key_is_held() {
+        let mut parser = Parser::default();
+        assert_eq!(parser.feed(b"\x1b[27;2"), []);
+        assert_eq!(parser.feed(b";13~"), [Piece::Keys(b"\x1b\r".to_vec())]);
+    }
+
+    #[test]
     fn other_escape_sequences_are_keys() {
         let mut parser = Parser::default();
         // Arrow up and a bracketed paste start pass straight through.
         assert_eq!(
-            parser.feed(b"\x1b[A\x1b[200~"),
-            [Piece::Keys(b"\x1b[A\x1b[200~".to_vec())]
+            parser.feed(b"\x1b[A\x1b[200~\x1b[2~"),
+            [Piece::Keys(b"\x1b[A\x1b[200~\x1b[2~".to_vec())]
         );
         assert!(!parser.holding());
     }

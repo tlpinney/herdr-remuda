@@ -151,6 +151,7 @@ impl Screen {
 impl Drop for Screen {
     fn drop(&mut self) {
         write_out(input::MOUSE_OFF);
+        write_out(input::MODIFIED_KEYS_OFF);
         write_out(b"\x1b[?1049l");
         let _ = crossterm::terminal::disable_raw_mode();
     }
@@ -415,9 +416,11 @@ impl Mirror {
             if let Err(err) = self.start_control() {
                 return Ok(Exit::Lost(err));
             }
-            // Ask for real mouse events; otherwise herdr turns the wheel into
-            // arrow keys, which an agent's prompt reads as input history.
+            // Ask for real mouse events (otherwise herdr turns the wheel into
+            // arrow keys, which an agent's prompt reads as input history) and
+            // for distinct modified keys, so Shift+Enter survives the trip.
             write_out(input::MOUSE_ON);
+            write_out(input::MODIFIED_KEYS_ON);
             spawn_layout_watcher(
                 Arc::clone(&self.geometry),
                 self.natural,
@@ -483,6 +486,7 @@ impl Mirror {
                     }
                     self.control_size = None;
                     write_out(input::MOUSE_OFF);
+                    write_out(input::MODIFIED_KEYS_OFF);
                     self.note = "another client has control · view-only".into();
                     self.draw_status();
                 }
