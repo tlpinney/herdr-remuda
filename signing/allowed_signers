@@ -1,0 +1,3 @@
+# Keys trusted to sign remuda releases (ssh-keygen -Y verify format).
+# Namespace: remuda-release. Signer identity: tlpinney.
+tlpinney namespaces="remuda-release" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFSZDt6uNCxuvSttHDBUcV1dctXJ1DBwYnQdbk19FfFP

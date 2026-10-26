@@ -1,0 +1,96 @@
+name: release
+
+# Pushing a version tag (v0.2.0) tests, builds and attests the binaries, then
+# creates a DRAFT release with SHA256SUMS. The maintainer signs SHA256SUMS
+# offline and publishes the release with `just sign-release v0.2.0`; CI never
+# holds the signing key. The tag must match the version in Cargo.toml and
+# herdr-plugin.toml, because the plugin's install step downloads that release.
+#
+# Actions are pinned to full commit SHAs; the comment shows the release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Tag matches the crate and plugin versions
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          crate="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          plugin="$(sed -n 's/^version = "\(.*\)"/\1/p' herdr-plugin.toml | head -1)"
+          echo "tag=$tag crate=$crate plugin=$plugin"
+          [ "$tag" = "$crate" ] && [ "$tag" = "$plugin" ]
+      - run: cargo fmt --check
+      - run: cargo test --locked
+      - run: cargo clippy --locked --all-targets -- -D warnings
+
+  build:
+    needs: check
+    strategy:
+      matrix:
+        include:
+          - { asset: macos-aarch64, target: aarch64-apple-darwin, os: macos-latest }
+          - { asset: macos-x86_64, target: x86_64-apple-darwin, os: macos-latest }
+          - { asset: linux-x86_64, target: x86_64-unknown-linux-musl, os: ubuntu-latest }
+          - { asset: linux-aarch64, target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install musl tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: rustup target add ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          mkdir -p dist
+          tar -czf "dist/remuda-${{ matrix.asset }}.tar.gz" \
+            -C "target/${{ matrix.target }}/release" remuda
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum remuda-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+      - name: Attest build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/remuda-*.tar.gz
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            --draft \
+            --verify-tag

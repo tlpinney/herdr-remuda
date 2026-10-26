@@ -5,8 +5,10 @@ min_herdr_version = "0.9.2"
 description = "Pick panes from any machine into a view of your own: live mirrors with selectable resize policies"
 platforms = ["linux", "macos"]
 
+# Downloads the signed prebuilt binary for this version, or builds it with
+# cargo when no release is available.
 [[build]]
-command = ["cargo", "build", "--release", "--locked"]
+command = ["sh", "scripts/install-binary.sh"]
 
 # Puts remuda on PATH so herdr can resume mirrors after a restart.
 [[startup]]
