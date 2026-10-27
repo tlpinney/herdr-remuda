@@ -23,7 +23,6 @@ use ratatui::Frame;
 use serde_json::Value;
 
 use crate::config::Config;
-use crate::github;
 use crate::herdr::{self, MARK};
 use crate::herds::{self, Seen};
 
@@ -80,8 +79,6 @@ struct Member {
     note: String,
     /// What the agent is doing, from its terminal title.
     context: String,
-    /// Its PR's state, e.g. `PR #12 · CI failing`, from the GitHub channel.
-    pr: String,
     /// Why it wants a seat now, and since when; orders the queue.
     reason: Option<Reason>,
     since: Option<Instant>,
@@ -105,7 +102,6 @@ impl Member {
             status: "starting".into(),
             note: String::new(),
             context: seen.title.clone(),
-            pr: String::new(),
             reason: None,
             since: None,
             seat: None,
@@ -633,10 +629,6 @@ fn board(options: BoardOptions) -> Result<(), String> {
     };
     let (events, inbox) = mpsc::channel();
     spawn_poller(events);
-    let (targets, github_targets) = mpsc::channel();
-    let (github_statuses, statuses) = mpsc::channel();
-    github::spawn(github_targets, github_statuses);
-    let github = Github { targets, statuses };
     let mut terminal = ratatui::init();
     let mut state = Board {
         members: Vec::new(),
@@ -645,7 +637,7 @@ fn board(options: BoardOptions) -> Result<(), String> {
         grid,
         shown_grid: None,
     };
-    let result = watch(&mut state, &anchor, &board, &inbox, &github, &mut terminal);
+    let result = watch(&mut state, &anchor, &board, &inbox, &mut terminal);
     ratatui::restore();
     for member in &state.members {
         if let Some(seat) = &member.seat {
@@ -656,18 +648,11 @@ fn board(options: BoardOptions) -> Result<(), String> {
     result
 }
 
-/// The board's ends of the GitHub channel's thread.
-struct Github {
-    targets: Sender<Vec<github::Target>>,
-    statuses: Receiver<Vec<github::Status>>,
-}
-
 fn watch(
     state: &mut Board,
     anchor: &str,
     board: &str,
     inbox: &Receiver<Poll>,
-    github: &Github,
     terminal: &mut ratatui::DefaultTerminal,
 ) -> Result<(), String> {
     let mut last = Poll::default();
@@ -704,19 +689,7 @@ fn watch(
                 notify(&state.members[index]);
             }
             state.prune();
-            let _ = github.targets.send(poll.seen.clone());
             last = poll;
-        }
-        while let Ok(statuses) = github.statuses.try_recv() {
-            for status in statuses {
-                if let Some(member) = state
-                    .members
-                    .iter_mut()
-                    .find(|m| m.machine == status.machine && m.pane == status.pane)
-                {
-                    member.pr = status.text;
-                }
-            }
         }
         terminal
             .draw(|frame| draw(frame, state, &last, polled))
@@ -976,14 +949,6 @@ fn member_line(member: &Member, waiting: Option<usize>) -> Line<'static> {
         Span::styled(format!("{:<9} ", member.status), style),
         Span::from(place).bold(),
     ];
-    if !member.pr.is_empty() {
-        let style = if member.pr.contains("failing") {
-            Style::new().red()
-        } else {
-            Style::new().dim()
-        };
-        spans.push(Span::styled(format!("  {}", member.pr), style));
-    }
     if !member.context.is_empty() {
         spans.push(Span::from(format!("  {}", truncate(&member.context, 50))).dim());
     }
@@ -1011,8 +976,6 @@ mod tests {
             status: status.into(),
             launched: None,
             title: String::new(),
-            cwd: String::new(),
-            pr: None,
         }
     }
 

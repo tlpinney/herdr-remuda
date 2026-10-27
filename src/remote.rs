@@ -66,12 +66,6 @@ impl Remote {
         self.script_via(&script, self.connection_ready(), true)
     }
 
-    /// An `ssh` command running a shell `script` on the machine, the same way
-    /// as `herdr_command`.
-    pub fn shell_command(&self, script: &str) -> Command {
-        self.script_via(script, self.connection_ready(), false)
-    }
-
     fn command_via(&self, args: &[&str], shared: bool) -> Command {
         self.script_via(&format!("exec {}", self.remote_script(args)), shared, false)
     }
