@@ -5,10 +5,10 @@
 //! machine watches (see `herds`). When an agent turns `blocked`, the board
 //! opens a driven mirror of it (a seat) in this tab and shows a toast; once
 //! the agent is working again the seat closes, freeing it for the next one.
-//! Seats stack below the pane they open beside while the rows stay tall
-//! enough, then go side by side, so that pane stays in the top-left corner.
-//! Membership is read from each herd's workspace on every poll, so agents
-//! added to or removed from a herd come and go without restarting the board.
+//! Seats split this tab right while the columns stay wide enough, then down,
+//! so the board stays in the top-left corner. Membership is read from each
+//! herd's workspace on every poll, so agents added to or removed from a herd
+//! come and go without restarting the board.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -235,10 +235,9 @@ impl Direction {
 }
 
 /// Where the next seat goes in this tab's `pane layout`: a split of the board
-/// or a seat (`ours`), never of the user's other panes. Stacking (a split
-/// down) wins while both halves stay `MIN_ROWS` tall; then side by side (a
-/// split right) while both stay `MIN_COLS` wide. `None` when the tab has no
-/// room.
+/// or a seat (`ours`), never of the user's other panes. Splitting right wins
+/// while both halves stay `MIN_COLS` wide; then down while both stay
+/// `MIN_ROWS` tall. `None` when the tab has no room.
 fn place(layout: &Value, ours: &HashSet<String>) -> Option<(String, Direction)> {
     let panes: Vec<(&str, u64, u64)> = layout["panes"]
         .as_array()?
@@ -250,18 +249,18 @@ fn place(layout: &Value, ours: &HashSet<String>) -> Option<(String, Direction)> 
         })
         .filter(|(id, _, _)| ours.contains(*id))
         .collect();
-    let down = panes
+    let right = panes
         .iter()
-        .filter(|(_, _, height)| *height >= 2 * MIN_ROWS)
-        .max_by_key(|(_, width, height)| (*height, *width));
-    if let Some((id, _, _)) = down {
-        return Some((id.to_string(), Direction::Down));
+        .filter(|(_, width, _)| *width >= 2 * MIN_COLS)
+        .max_by_key(|(_, width, height)| (*width, *height));
+    if let Some((id, _, _)) = right {
+        return Some((id.to_string(), Direction::Right));
     }
     panes
         .iter()
-        .filter(|(_, width, _)| *width >= 2 * MIN_COLS)
-        .max_by_key(|(_, width, height)| (*width, *height))
-        .map(|(id, _, _)| (id.to_string(), Direction::Right))
+        .filter(|(_, _, height)| *height >= 2 * MIN_ROWS)
+        .max_by_key(|(_, width, height)| (*height, *width))
+        .map(|(id, _, _)| (id.to_string(), Direction::Down))
 }
 
 /// `remuda herd …`: the board, a herd command, or the original one-shot form
@@ -824,21 +823,13 @@ mod tests {
     }
 
     #[test]
-    fn seats_stack_while_rows_stay_tall_then_go_side_by_side() {
-        let ours = open(&["b", "s1", "s2", "s3"]);
-        let tall = layout(&[("b", 163, 51)]);
-        assert_eq!(place(&tall, &ours), Some(("b".into(), Direction::Down)));
-        let stacked = layout(&[("b", 163, 25), ("s1", 163, 26)]);
-        assert_eq!(
-            place(&stacked, &ours),
-            Some(("s1".into(), Direction::Right))
-        );
-        let full = layout(&[
-            ("b", 81, 25),
-            ("s2", 82, 25),
-            ("s1", 81, 26),
-            ("s3", 82, 26),
-        ]);
+    fn seats_split_right_while_columns_stay_wide_then_down() {
+        let ours = open(&["b", "s1", "s2"]);
+        let wide = layout(&[("b", 163, 51)]);
+        assert_eq!(place(&wide, &ours), Some(("b".into(), Direction::Right)));
+        let columns = layout(&[("b", 82, 51), ("s1", 81, 51)]);
+        assert_eq!(place(&columns, &ours), Some(("b".into(), Direction::Down)));
+        let full = layout(&[("b", 82, 25), ("s2", 82, 25), ("s1", 81, 25)]);
         assert_eq!(place(&full, &ours), None);
     }
 
