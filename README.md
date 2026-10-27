@@ -8,7 +8,7 @@ A [Herdr](https://herdr.dev) plugin for picking the panes you want to work with,
 - **Survives restarts and drops.** Herdr reopens mirrors after a server restart, and a mirror reconnects by itself after a network drop, sleep, or a remote restart.
 - **Herds.** Named groups of agents on remote machines; each one opens beside you when it needs input, and goes away once you answer. Add and remove agents while they run.
 - **Messages.** Send an agent, or a whole herd, a message that it reads once it is idle.
-- **Shows who is watching.** The source machine's sidebar marks a mirrored agent, e.g. `claude ⇄ travis-air (control)`, and your sidebar lists the mirror with the source's state.
+- **Shows who is watching.** The source machine's sidebar marks a mirrored agent, e.g. `claude ⇄ my-laptop (control)`, and your sidebar lists the mirror with the source's state.
 
 It uses only Herdr's CLI and socket API (`terminal session observe` and `control`), so it needs no changes to Herdr, and nothing has to be installed on the machines you mirror from.
 
@@ -125,7 +125,7 @@ npx skills add tlpinney/remuda --skill remuda -g
 
 ```toml
 # How this machine appears on panes it mirrors (default: the host name).
-name = "travis-air"
+name = "my-laptop"
 # The herd board's seat grid, ROWSxCOLS (default: what fits the screen).
 grid = "2x4"
 ```

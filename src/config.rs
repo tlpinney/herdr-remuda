@@ -2,7 +2,7 @@
 //!
 //! ```toml
 //! # How this machine appears on panes it mirrors (default: the host name).
-//! name = "travis-air"
+//! name = "my-laptop"
 //! # The herd board's seat grid, ROWSxCOLS (default: what fits the screen).
 //! grid = "2x4"
 //! ```
@@ -92,8 +92,8 @@ mod tests {
 
     #[test]
     fn configured_name_wins_and_blank_falls_back() {
-        let named: Config = toml::from_str(r#"name = " travis-air ""#).unwrap();
-        assert_eq!(named.machine_name(), "travis-air");
+        let named: Config = toml::from_str(r#"name = " my-laptop ""#).unwrap();
+        assert_eq!(named.machine_name(), "my-laptop");
         let blank: Config = toml::from_str(r#"name = "  ""#).unwrap();
         assert!(!blank.machine_name().is_empty());
     }

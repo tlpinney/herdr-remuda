@@ -4,7 +4,7 @@
 //! The mark is pane metadata on the source, written through `herdr --machine`
 //! like everything else remuda does remotely, so nothing runs on the source
 //! machine. While the source runs an agent, its sidebar name becomes e.g.
-//! `claude ⇄ travis-air (control)`; every source also gets `remuda_watcher`
+//! `claude ⇄ my-laptop (control)`; every source also gets `remuda_watcher`
 //! and `remuda_watch_mode` tokens for custom sidebar rows. The mark carries a
 //! TTL and is refreshed while the mirror lives, so a mirror that dies without
 //! clearing it only leaves it behind briefly.
@@ -213,10 +213,10 @@ mod tests {
 
     fn watcher(mode: Mode) -> Watcher {
         Watcher {
-            id: source_id("Travis Air", Some("wA:p6Q")),
+            id: source_id("My Laptop", Some("wA:p6Q")),
             source_pane: "w9:p1".into(),
             machine: Some("devbox".into()),
-            name: "Travis Air".into(),
+            name: "My Laptop".into(),
             mode,
         }
     }
@@ -225,9 +225,9 @@ mod tests {
     fn agent_sources_get_a_display_name_guarded_by_the_agent() {
         let args = show_args(&watcher(Mode::Control), Some("claude"));
         let joined = args.join(" ");
-        assert!(joined.contains("--source remuda-watch-travis-air-wa:p6q"));
+        assert!(joined.contains("--source remuda-watch-my-laptop-wa:p6q"));
         assert!(
-            joined.contains("--agent claude --display-agent claude \u{21c4} Travis Air (control)")
+            joined.contains("--agent claude --display-agent claude \u{21c4} My Laptop (control)")
         );
         assert!(joined.contains("--ttl-ms 90000"));
     }
