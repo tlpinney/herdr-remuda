@@ -84,6 +84,8 @@ remuda herd list                               # herds, their agents and states
 
 `--kind` picks the agent, `--cwd` its directory on the machine, and arguments after `--` go to the agent. A kind Herdr cannot start itself, such as `auggie`, is run in the tab's shell, and its Herdr plugin (for auggie, [herdr-auggie](https://github.com/tlpinney/herdr-auggie)) must be installed on that machine to report its state. Until such an agent first reports, which can wait on a startup screen, the board shows it as `startup` after 8 seconds and gives it a seat. The herds this machine watches are kept in `herds.json` in the plugin state directory; `remuda herd --machine ziggy [--name ops] …` still starts a herd and opens the board in one step.
 
+**GitHub.** The board passes GitHub news to the agent working on a PR, as a nudge to look rather than the content: "CI failed on PR #12 (test). Look at the failure with `gh pr checks 12` and fix it.", or "There are new comments and reviews on PR #12 from @alice. Read them with `gh pr view 12 --comments` and follow up." An agent's PR is the one it tagged its pane with after opening it (`herdr pane report-metadata "$HERDR_PANE_ID" --source remuda-pr --token remuda_pr=<url>`), or else the open PR for the branch checked out where it works, when it is the only agent in that worktree. The board checks linked PRs with `gh` on this machine once a minute, shows each one's CI state, and nudges only about what is new since it started watching.
+
 **Message agents.** `remuda send` types a message into an agent once it is idle, after a `[from <sender>]` prefix so the agent can tell it from your own words:
 
 ```bash

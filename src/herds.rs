@@ -26,6 +26,9 @@ const TOKEN_SOURCE: &str = "remuda-herd";
 pub const TOKEN_HERD: &str = "remuda_herd";
 pub const TOKEN_NAME: &str = "remuda_name";
 pub const TOKEN_LAUNCHED: &str = "remuda_launched";
+/// The PR an agent works on; the agent sets it itself (metadata source
+/// `remuda-pr`) after opening the PR.
+pub const TOKEN_PR: &str = "remuda_pr";
 /// Tries at `agent start` while a new pane's shell is still starting.
 const START_TRIES: u32 = 5;
 
@@ -97,6 +100,7 @@ fn find_ref(text: &str) -> Result<Herd, String> {
 }
 
 /// A herd's agent as a pane list shows it.
+#[derive(Debug, Clone)]
 pub struct Seen {
     pub pane: String,
     pub name: String,
@@ -107,6 +111,10 @@ pub struct Seen {
     pub launched: Option<u64>,
     /// The pane's terminal title: agents set it to what they are doing.
     pub title: String,
+    /// The directory the agent works in.
+    pub cwd: String,
+    /// The PR it tagged its pane with, if any.
+    pub pr: Option<String>,
 }
 
 /// The members of `workspace` in a machine's `pane list`: agent panes, and
@@ -145,6 +153,15 @@ pub fn members(listed: &Value, workspace: &str) -> Vec<Seen> {
                     .unwrap_or_default()
                     .trim()
                     .to_string(),
+                cwd: pane["foreground_cwd"]
+                    .as_str()
+                    .or_else(|| pane["cwd"].as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                pr: tokens[TOKEN_PR]
+                    .as_str()
+                    .filter(|url| !url.is_empty())
+                    .map(str::to_string),
             })
         })
         .collect()

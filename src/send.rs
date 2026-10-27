@@ -171,6 +171,23 @@ pub fn run(args: &[String]) -> Result<(), String> {
     }
 }
 
+/// Delivers `text` from `from` to the agent `target` (a name or pane id) on
+/// `machine`, as `remuda send` does: prefixed, typed once the agent is idle,
+/// and logged under `to`.
+pub fn post(
+    from: &str,
+    to: &str,
+    target: &str,
+    machine: Option<&str>,
+    wait: Duration,
+    text: &str,
+) -> Result<&'static str, String> {
+    let message = format!("{} {text}", prefix(from));
+    let outcome = deliver(target, machine, wait, &message);
+    log(from, to, text, &outcome);
+    outcome
+}
+
 /// `[from aug-1@ziggy]`.
 fn prefix(from: &str) -> String {
     format!("[from {from}]")

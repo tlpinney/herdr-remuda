@@ -52,17 +52,46 @@ impl Remote {
         self.command_via(args, self.connection_ready())
     }
 
+    /// Like `herdr_command`, for a command that runs until it is stopped and
+    /// ignores its input (an observe stream). It gets a terminal on the
+    /// machine, in raw mode so its output passes unchanged, so that closing
+    /// the connection hangs it up. Without one it would outlive the
+    /// connection and keep holding a session of the shared connection until
+    /// it next wrote, which for a quiet pane is never.
+    pub fn herdr_stream_command(&self, args: &[&str]) -> Command {
+        let script = format!(
+            "stty raw -echo 2>/dev/null; exec {}",
+            self.remote_script(args)
+        );
+        self.script_via(&script, self.connection_ready(), true)
+    }
+
+    /// An `ssh` command running a shell `script` on the machine, the same way
+    /// as `herdr_command`.
+    pub fn shell_command(&self, script: &str) -> Command {
+        self.script_via(script, self.connection_ready(), false)
+    }
+
     fn command_via(&self, args: &[&str], shared: bool) -> Command {
-        let script = self.remote_script(args);
+        self.script_via(&format!("exec {}", self.remote_script(args)), shared, false)
+    }
+
+    /// `tty` forces a terminal on the machine (`-tt`) instead of none (`-T`).
+    fn script_via(&self, script: &str, shared: bool, tty: bool) -> Command {
         let mut command = Command::new("ssh");
         if shared {
             command.args(["-F", "/dev/null", "-o", "ControlMaster=no", "-o"]);
             command.arg(format!("ControlPath={}", self.socket.display()));
+            // When the master refuses a session (sshd's MaxSessions), ssh falls
+            // back to a direct connection that cannot work without the user's
+            // config; fail it fast instead of waiting out the TCP timeout.
+            command.args(["-o", "ConnectTimeout=5"]);
         } else {
             command.args(["-o", "ServerAliveInterval=15"]);
         }
-        command.args(["-o", "BatchMode=yes", "-T", &self.target]);
-        command.arg(format!("exec {script}"));
+        let tty = if tty { "-tt" } else { "-T" };
+        command.args(["-o", "BatchMode=yes", tty, &self.target]);
+        command.arg(script);
         command
     }
 
@@ -296,6 +325,16 @@ mod tests {
         assert_eq!(&args[..2], ["-F", "/dev/null"]);
         assert!(args.iter().any(|arg| arg.starts_with("ControlPath=/")));
         assert_eq!(args.last().unwrap(), "exec herdr pane list");
+    }
+
+    #[test]
+    fn streams_get_a_raw_terminal_so_closing_hangs_them_up() {
+        let remote = Remote::new(&machine(None));
+        let args = args_of(&remote.script_via("x", true, true));
+        assert!(args.iter().any(|arg| arg == "-tt"));
+        assert!(!args.iter().any(|arg| arg == "-T"));
+        let plain = args_of(&remote.command_via(&["pane", "list"], true));
+        assert!(plain.iter().any(|arg| arg == "-T"));
     }
 
     #[test]

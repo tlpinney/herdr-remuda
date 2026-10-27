@@ -14,6 +14,7 @@
 mod config;
 mod context;
 mod geometry;
+mod github;
 mod herd;
 mod herdr;
 mod herds;

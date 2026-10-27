@@ -130,6 +130,22 @@ pub fn run_on(machine: Option<&str>, args: &[&str]) -> Result<(), String> {
     Err(format!("herdr {}: {}", args.join(" "), message.trim()))
 }
 
+/// Runs a shell script on the saved machine `machine` and returns its
+/// output, through the machine's shared connection when it is up.
+pub fn shell_on(machine: &str, script: &str) -> Result<String, String> {
+    let machine = cached_machine(machine)
+        .ok_or_else(|| format!("no enabled saved machine named {machine}"))?;
+    let output = Remote::new(&machine)
+        .shell_command(script)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|err| format!("could not run ssh: {err}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Machine {
     pub id: String,
@@ -226,7 +242,13 @@ pub fn stream_command(
         }
         Some(machine) => {
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
-            Remote::new(machine).herdr_command(&args)
+            let remote = Remote::new(machine);
+            match kind {
+                // Observe ignores its input, so only a hangup stops it on
+                // the machine; control ends when its input does.
+                StreamKind::Observe => remote.herdr_stream_command(&args),
+                StreamKind::Control => remote.herdr_command(&args),
+            }
         }
     }
 }
