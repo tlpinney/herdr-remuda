@@ -8,6 +8,7 @@
 //!   open-popup <entrypoint>  open one of the plugin's popups (plugin actions)
 //!   install [--quiet]        put remuda on PATH so herdr can resume mirrors
 //!   views list|open <name>|delete <name>
+//!   --skill                  print the agent skill file
 
 mod config;
 mod context;
@@ -27,6 +28,10 @@ mod views;
 
 use std::process::ExitCode;
 
+/// The agent skill, built in so `remuda --skill` matches this release, as
+/// `herdr --skill` does.
+const SKILL: &str = include_str!("../skills/remuda/SKILL.md");
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let command = args.first().map(String::as_str).unwrap_or("view");
@@ -39,6 +44,10 @@ fn main() -> ExitCode {
         "open-popup" => open_popup(rest),
         "install" => install::run(rest),
         "views" => views_command(rest),
+        "--skill" => {
+            print!("{SKILL}");
+            Ok(())
+        }
         other => Err(format!("unknown command {other:?}")),
     };
     let Err(err) = result else {

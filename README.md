@@ -80,6 +80,16 @@ remuda views open <name> [--workspace <id>] [--no-focus]
 remuda views delete <name>
 ```
 
+## Agent skill
+
+remuda ships a skill at [`skills/remuda/SKILL.md`](skills/remuda/SKILL.md) that teaches a coding agent running in a Herdr pane to open mirrors and views and to run herds. Install it the way Herdr's own skill installs:
+
+```bash
+npx skills add tlpinney/remuda --skill remuda -g
+```
+
+`-g` installs it for your supported agents globally; leave it out to install it into the current project. `remuda --skill` prints the copy built into your remuda binary.
+
 ## Configuration
 
 `config.toml` in the plugin config directory (`herdr plugin config-dir remuda`):
