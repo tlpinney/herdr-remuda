@@ -171,7 +171,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     }
 }
 
-/// `[from aug-1@ziggy]`.
+/// `[from aug-1@devbox]`.
 fn prefix(from: &str) -> String {
     format!("[from {from}]")
 }
@@ -308,8 +308,8 @@ mod tests {
     #[test]
     fn targets_name_an_agent_and_optionally_a_machine() {
         assert_eq!(
-            parse_target("aug-1@ziggy").unwrap(),
-            ("aug-1".into(), Some("ziggy".into()))
+            parse_target("aug-1@devbox").unwrap(),
+            ("aug-1".into(), Some("devbox".into()))
         );
         assert_eq!(parse_target("wR:p1").unwrap(), ("wR:p1".into(), None));
         assert_eq!(
@@ -318,17 +318,17 @@ mod tests {
         );
         // Machine labels may contain @; the agent part never does.
         assert_eq!(
-            parse_target("a@env:dev@ziggy").unwrap(),
-            ("a@env:dev".into(), Some("ziggy".into()))
+            parse_target("a@env:dev@devbox").unwrap(),
+            ("a@env:dev".into(), Some("devbox".into()))
         );
-        assert!(parse_target("@ziggy").is_err());
+        assert!(parse_target("@devbox").is_err());
         assert!(parse_target("aug-1@").is_err());
     }
 
     #[test]
     fn options_take_flags_anywhere_and_the_rest_as_text() {
         let options = Options::parse(&args(&[
-            "aug-1@ziggy",
+            "aug-1@devbox",
             "--wait",
             "5",
             "rebase",
@@ -344,10 +344,10 @@ mod tests {
         assert_eq!(Options::parse(&args(&["herd-1"])).unwrap().text, None);
         assert!(Options::parse(&args(&[])).is_err());
         assert!(Options::parse(&args(&["herd-1", "--bogus"])).is_err());
-        let herd = Options::parse(&args(&["@ops@ziggy", "status?"])).unwrap();
+        let herd = Options::parse(&args(&["@ops@devbox", "status?"])).unwrap();
         assert_eq!(
             (herd.agent.as_str(), herd.machine.as_deref()),
-            ("@ops", Some("ziggy"))
+            ("@ops", Some("devbox"))
         );
         assert!(Options::parse(&args(&["@ops", "hi"])).is_err());
     }
@@ -355,11 +355,11 @@ mod tests {
     #[test]
     fn the_sender_is_the_agent_name_then_its_kind_and_pane() {
         let named = json!({"name": "herd-1", "agent": "claude", "pane_id": "wM:p1"});
-        assert_eq!(sender_name(Some(&named), "ziggy"), "herd-1@ziggy");
+        assert_eq!(sender_name(Some(&named), "devbox"), "herd-1@devbox");
         let unnamed = json!({"agent": "claude", "pane_id": "wA:p7"});
         assert_eq!(sender_name(Some(&unnamed), "air"), "claude wA:p7@air");
         assert_eq!(sender_name(None, "air"), "air");
-        assert_eq!(prefix("herd-1@ziggy"), "[from herd-1@ziggy]");
+        assert_eq!(prefix("herd-1@devbox"), "[from herd-1@devbox]");
     }
 
     #[test]

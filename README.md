@@ -63,8 +63,8 @@ herdr plugin link .
 **Run herds.** A herd is a named group of agents on one saved machine: one workspace there, labelled with the herd's name, with one tab per agent. From a shell in Herdr:
 
 ```bash
-remuda herd new ops@ziggy --count 3 --cwd ~/code/project   # start 3 Claude agents: ops-1…ops-3
-remuda herd new aug@ziggy --count 2 --kind auggie          # another herd, of auggie agents
+remuda herd new ops@devbox --count 3 --cwd ~/code/project   # start 3 Claude agents: ops-1…ops-3
+remuda herd new aug@devbox --count 2 --kind auggie          # another herd, of auggie agents
 remuda herd                                                # the board, in the pane you run it in
 remuda herd --beside wA:p7 --grid 2x4                      # seats open in a 2×4 grid around pane wA:p7
 ```
@@ -74,22 +74,22 @@ The board watches every herd this machine knows. When an agent turns blocked (re
 Change a herd while the board runs; it reads each herd's workspace on every poll:
 
 ```bash
-remuda herd add ops@ziggy --count 2            # two more agents (ops-4, ops-5)
-remuda herd remove ops@ziggy ops-2             # move ops-2 to a workspace of its own; it keeps running
-remuda herd adopt old@ziggy wR                 # make an existing workspace a herd
-remuda herd forget ops@ziggy                   # stop watching it; its agents keep running
-remuda herd stop ops@ziggy                     # end its agents: closes the workspace, then forgets it
+remuda herd add ops@devbox --count 2            # two more agents (ops-4, ops-5)
+remuda herd remove ops@devbox ops-2             # move ops-2 to a workspace of its own; it keeps running
+remuda herd adopt old@devbox wR                 # make an existing workspace a herd
+remuda herd forget ops@devbox                   # stop watching it; its agents keep running
+remuda herd stop ops@devbox                     # end its agents: closes the workspace, then forgets it
 remuda herd list                               # herds, their agents and states
 ```
 
-`--kind` picks the agent, `--cwd` its directory on the machine (`~` is that machine's home, and a path your shell already expanded under this machine's home moves to the same place under the other's), and arguments after `--` go to the agent. A kind Herdr cannot start itself, such as `auggie`, is run in the tab's shell, and its Herdr plugin (for auggie, [herdr-auggie](https://github.com/tlpinney/herdr-auggie)) must be installed on that machine to report its state. Until such an agent first reports, which can wait on a startup screen, the board shows it as `startup` after 8 seconds and gives it a seat. The herds this machine watches are kept in `herds.json` in the plugin state directory; `remuda herd --machine ziggy [--name ops] …` still starts a herd and opens the board in one step.
+`--kind` picks the agent, `--cwd` its directory on the machine (`~` is that machine's home, and a path your shell already expanded under this machine's home moves to the same place under the other's), and arguments after `--` go to the agent. A kind Herdr cannot start itself, such as `auggie`, is run in the tab's shell, and its Herdr plugin (for auggie, [herdr-auggie](https://github.com/tlpinney/herdr-auggie)) must be installed on that machine to report its state. Until such an agent first reports, which can wait on a startup screen, the board shows it as `startup` after 8 seconds and gives it a seat. The herds this machine watches are kept in `herds.json` in the plugin state directory; `remuda herd --machine devbox [--name ops] …` still starts a herd and opens the board in one step.
 
 **Message agents.** `remuda send` types a message into an agent once it is idle, after a `[from <sender>]` prefix so the agent can tell it from your own words:
 
 ```bash
-remuda send ops-1@ziggy "rebase on main when you can"
-remuda send @ops@ziggy "status?"               # every agent in the herd
-echo "long text" | remuda send ops-1@ziggy
+remuda send ops-1@devbox "rebase on main when you can"
+remuda send @ops@devbox "status?"               # every agent in the herd
+echo "long text" | remuda send ops-1@devbox
 ```
 
 It waits up to 10 minutes for a busy or blocked agent (`--wait`), names the sender after the sending pane's agent (`--from` to override), and records every message in `messages.jsonl` in the plugin state directory. The prefix is a convention, not a proof: anything that can run `remuda send` can claim any sender.
@@ -97,7 +97,7 @@ It waits up to 10 minutes for a busy or blocked agent (`--wait`), names the send
 From a shell inside Herdr:
 
 ```bash
-remuda view --source w9:p1 --machine ziggy --mode control --size follow
+remuda view --source w9:p1 --machine devbox --mode control --size follow
 remuda herd [--grid ROWSxCOLS] [--seats N] [--beside PANE]
 remuda herd new|add <herd>@<machine> [--count N] [--kind claude] [--cwd DIR] [-- AGENT_ARGS]
 remuda herd remove <herd>@<machine> <agent>

@@ -278,8 +278,8 @@ mod tests {
     fn machine(session: Option<&str>) -> Machine {
         Machine {
             id: "id".into(),
-            label: "ziggy".into(),
-            target: "ziggy".into(),
+            label: "devbox".into(),
+            target: "devbox".into(),
             session: session.map(str::to_string),
             enabled: true,
         }

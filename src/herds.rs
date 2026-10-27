@@ -638,17 +638,17 @@ mod tests {
     #[test]
     fn refs_need_a_plain_name_and_a_machine() {
         assert_eq!(
-            parse_ref("ops@ziggy").unwrap(),
-            ("ops".into(), "ziggy".into())
+            parse_ref("ops@devbox").unwrap(),
+            ("ops".into(), "devbox".into())
         );
         assert_eq!(
-            parse_ref("ops@env:dev@ziggy").unwrap(),
-            ("ops".into(), "env:dev@ziggy".into())
+            parse_ref("ops@env:dev@devbox").unwrap(),
+            ("ops".into(), "env:dev@devbox".into())
         );
         assert!(parse_ref("ops").is_err());
-        assert!(parse_ref("@ziggy").is_err());
+        assert!(parse_ref("@devbox").is_err());
         assert!(parse_ref("ops@").is_err());
-        assert!(parse_ref("my herd@ziggy").is_err());
+        assert!(parse_ref("my herd@devbox").is_err());
     }
 
     #[test]
@@ -719,18 +719,18 @@ mod tests {
     #[test]
     fn directory_answers_parse_or_explain() {
         assert_eq!(
-            parse_cwd("/h/x\n", "ziggy").unwrap(),
+            parse_cwd("/h/x\n", "devbox").unwrap(),
             ("/h/x".into(), false)
         );
         assert_eq!(
-            parse_cwd("mapped /h/x", "ziggy").unwrap(),
+            parse_cwd("mapped /h/x", "devbox").unwrap(),
             ("/h/x".into(), true)
         );
         assert_eq!(
-            parse_cwd("missing /h/nope", "ziggy").unwrap_err(),
-            "no directory /h/nope on ziggy"
+            parse_cwd("missing /h/nope", "devbox").unwrap_err(),
+            "no directory /h/nope on devbox"
         );
-        assert!(parse_cwd("", "ziggy").is_err());
+        assert!(parse_cwd("", "devbox").is_err());
     }
 
     #[test]

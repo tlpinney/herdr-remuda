@@ -1,7 +1,7 @@
 //! Reports a mirror pane to herdr as an agent.
 //!
 //! The report gives the mirror the source's state in the sidebar, a display
-//! name such as `⇄ claude@ziggy`, the `remuda_*` tokens that saved views read,
+//! name such as `⇄ claude@devbox`, the `remuda_*` tokens that saved views read,
 //! and a resume command so herdr reopens the mirror after a server restart.
 
 use std::sync::mpsc::{self, Receiver, Sender};

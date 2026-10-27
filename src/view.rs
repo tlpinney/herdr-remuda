@@ -1025,7 +1025,7 @@ mod tests {
     fn spec() -> MirrorSpec {
         MirrorSpec {
             source: "w8:p1".into(),
-            machine: Some("ziggy".into()),
+            machine: Some("devbox".into()),
             ..MirrorSpec::default()
         }
     }
@@ -1035,7 +1035,7 @@ mod tests {
         let pane = json!({"agent": "claude", "agent_status": "working"});
         let report = mirror_report(&spec(), Some(&pane), true);
         assert_eq!(report.state, "working");
-        assert_eq!(report.display, "\u{21c4} claude@ziggy");
+        assert_eq!(report.display, "\u{21c4} claude@devbox");
         assert_eq!(report.resume.unwrap()[..2], ["remuda", "view"]);
     }
 
@@ -1044,7 +1044,7 @@ mod tests {
         let shell = json!({"agent_status": "unknown"});
         let report = mirror_report(&spec(), Some(&shell), false);
         assert_eq!(report.state, "idle");
-        assert_eq!(report.display, "\u{21c4} ziggy:w8:p1");
+        assert_eq!(report.display, "\u{21c4} devbox:w8:p1");
         assert_eq!(report.resume, None);
         assert_eq!(mirror_report(&spec(), None, true).state, "idle");
     }
@@ -1076,7 +1076,7 @@ mod tests {
             "input lost: terminal attach failed: terminal term_1 already has an attached client; retry with --takeover"
         ));
         assert!(!control_refused(
-            "input lost: Timeout, server ziggy not responding"
+            "input lost: Timeout, server devbox not responding"
         ));
         assert!(!control_refused("input lost"));
     }

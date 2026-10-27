@@ -179,7 +179,7 @@ impl MirrorSpec {
         (fits && argv.iter().all(|arg| resumable_arg(arg))).then_some(argv)
     }
 
-    /// Where the source lives, for labels: `ziggy` or `local`.
+    /// Where the source lives, for labels: `devbox` or `local`.
     pub fn place(&self) -> &str {
         self.machine.as_deref().unwrap_or("local")
     }
@@ -337,7 +337,7 @@ mod tests {
     fn spec() -> MirrorSpec {
         MirrorSpec {
             source: "w8:p1".into(),
-            machine: Some("ziggy".into()),
+            machine: Some("devbox".into()),
             mode: Mode::Control,
             size: Policy::Freeze,
             takeover: false,

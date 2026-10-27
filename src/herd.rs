@@ -967,7 +967,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    const HERD: &str = "ops@ziggy";
+    const HERD: &str = "ops@devbox";
 
     fn seen(pane: &str, status: &str) -> Seen {
         Seen {
@@ -983,10 +983,10 @@ mod tests {
         Poll {
             seen: agents
                 .into_iter()
-                .map(|agent| (HERD.to_string(), "ziggy".to_string(), agent))
+                .map(|agent| (HERD.to_string(), "devbox".to_string(), agent))
                 .collect(),
-            answered: HashSet::from(["ziggy".to_string()]),
-            watched: HashSet::from(["ziggy".to_string()]),
+            answered: HashSet::from(["devbox".to_string()]),
+            watched: HashSet::from(["devbox".to_string()]),
             herds: vec![HERD.into()],
             errors: Vec::new(),
         }

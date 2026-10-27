@@ -279,7 +279,7 @@ mod tests {
     fn panes() -> HashMap<String, Value> {
         let tokens = json!({
             "remuda_source": "w8:p1",
-            "remuda_machine": "ziggy",
+            "remuda_machine": "devbox",
             "remuda_mode": "control",
             "remuda_size": "freeze",
         });
@@ -290,7 +290,7 @@ mod tests {
             ),
             (
                 "w1:p2".to_string(),
-                json!({"pane_id": "w1:p2", "label": "\u{21c4} ziggy:w8:p1", "tokens": tokens}),
+                json!({"pane_id": "w1:p2", "label": "\u{21c4} devbox:w8:p1", "tokens": tokens}),
             ),
         ])
     }
@@ -326,7 +326,7 @@ mod tests {
         };
         assert_eq!(*label, None);
         assert_eq!(mirror.mode, Mode::Control);
-        assert_eq!(mirror.machine.as_deref(), Some("ziggy"));
+        assert_eq!(mirror.machine.as_deref(), Some("devbox"));
     }
 
     #[test]
@@ -361,7 +361,7 @@ mod tests {
 
     #[test]
     fn slugs_are_file_safe() {
-        assert_eq!(slug("Ops: Ziggy + local"), "ops-ziggy-local");
+        assert_eq!(slug("Ops: Devbox + local"), "ops-devbox-local");
         assert_eq!(slug("  "), "view");
         assert_eq!(slug("../etc"), "etc");
     }

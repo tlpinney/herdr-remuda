@@ -215,7 +215,7 @@ mod tests {
         Watcher {
             id: source_id("Travis Air", Some("wA:p6Q")),
             source_pane: "w9:p1".into(),
-            machine: Some("ziggy".into()),
+            machine: Some("devbox".into()),
             name: "Travis Air".into(),
             mode,
         }
