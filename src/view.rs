@@ -17,7 +17,7 @@ use base64::Engine;
 use serde_json::{json, Value};
 
 use crate::config::Config;
-use crate::geometry::{Size, SourceGeometry};
+use crate::geometry::{Policy, Size, SourceGeometry};
 use crate::herdr::{self, Machine, StreamKind, MARK};
 use crate::input;
 use crate::presence::{self, Presence};
@@ -509,6 +509,12 @@ impl Mirror {
             // for distinct modified keys, so Shift+Enter survives the trip.
             write_out(input::MOUSE_ON);
             write_out(input::MODIFIED_KEYS_ON);
+        }
+        // Only `source` and `smallest` follow the source's own layout; the
+        // others need no poll (each one is a session on a remote's connection).
+        if self.spec.mode == Mode::Control
+            && matches!(self.spec.size, Policy::Source | Policy::Smallest)
+        {
             spawn_layout_watcher(
                 Arc::clone(&self.geometry),
                 self.natural,

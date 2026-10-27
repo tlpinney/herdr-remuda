@@ -67,7 +67,7 @@ remuda herd --machine ziggy --count 3 --cwd ~/code/project
 
 This starts 3 Claude Code agents (`herd-1`…`herd-3`) on ziggy, one tab each in a new `herd` workspace, and turns your pane into a board of their states. When an agent turns blocked (red), a driven mirror of it opens in this tab and Herdr shows a toast. Answer it there; once the agent is working again for a moment, the mirror closes and frees its seat. At most 3 seats open at once (`--seats`), as many as fit: they split right while columns stay 70 wide, then down while panes stay 14 tall, so the board stays top-left. Agents that are blocked with no free seat wait in line, longest-waiting first. Closing a seat yourself (`ctrl+]`) leaves that agent alone until it asks again.
 
-`q` closes the board and its seats; the agents keep running, and `remuda herd --machine ziggy --workspace <id>` watches them again (it prints the id). `--kind` picks another agent, `--name` the name prefix, and arguments after `--` go to the agent.
+`q` closes the board and its seats; the agents keep running, and `remuda herd --machine ziggy --workspace <id>` watches them again (it prints the id). `--kind` picks another agent, `--name` the name prefix, and arguments after `--` go to the agent. A kind Herdr cannot start itself, such as `auggie`, is run in the tab's shell, and its Herdr plugin (for auggie, [herdr-auggie](https://github.com/tlpinney/herdr-auggie)) must be installed on the machine to report its state. Until such an agent first reports, which can wait on a startup screen, the board shows it as `startup` after 8 seconds and gives it a seat.
 
 From a shell inside Herdr:
 

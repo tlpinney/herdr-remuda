@@ -21,6 +21,7 @@ use ratatui::Frame;
 use serde_json::Value;
 
 use crate::herdr::{self, MARK};
+use crate::remote;
 use crate::spec;
 
 const POLL: Duration = Duration::from_secs(1);
@@ -33,6 +34,9 @@ const MIN_COLS: u64 = 70;
 const MIN_ROWS: u64 = 14;
 /// Tries at `agent start` while a new pane's shell is still starting.
 const START_TRIES: u32 = 5;
+/// How long an agent run in the shell may stay unreported before the herd
+/// treats it as waiting at a startup prompt.
+const UNREPORTED_AFTER: Duration = Duration::from_secs(8);
 
 struct Options {
     machine: String,
@@ -109,6 +113,10 @@ struct Member {
     /// The user closed this agent's seat while it was blocked: leave it until
     /// it is blocked again.
     waived: bool,
+    /// When the agent was run in the shell, until it reports itself to herdr.
+    /// Hook-reported agents (auggie) can stop at a startup prompt before
+    /// their first report, so a long silence counts as needing input.
+    launched: Option<Instant>,
 }
 
 impl Member {
@@ -122,6 +130,7 @@ impl Member {
             seat: None,
             calm: 0,
             waived: false,
+            launched: None,
         }
     }
 }
@@ -132,6 +141,8 @@ enum Action {
     Close(usize),
     /// This member just turned blocked.
     Notify(usize),
+    /// This member, run in the shell, just reported itself to herdr.
+    Reported(usize),
 }
 
 /// The seating rules, apart from herdr so they can be tested.
@@ -151,11 +162,21 @@ impl Herd {
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         for (index, member) in self.members.iter_mut().enumerate() {
-            let status = statuses
+            let mut status = statuses
                 .get(&member.pane)
                 .cloned()
                 .unwrap_or_else(|| "gone".into());
-            let blocked = status == "blocked";
+            if status != "no agent" {
+                if member.launched.take().is_some() && status != "gone" {
+                    actions.push(Action::Reported(index));
+                }
+            } else if member
+                .launched
+                .is_some_and(|at| now.saturating_duration_since(at) >= UNREPORTED_AFTER)
+            {
+                status = "startup".into();
+            }
+            let blocked = matches!(status.as_str(), "blocked" | "startup");
             if member
                 .seat
                 .as_ref()
@@ -251,7 +272,14 @@ fn place(layout: &Value, ours: &HashSet<String>) -> Option<(String, Direction)> 
 
 enum Event {
     Statuses(Result<HashMap<String, String>, String>),
-    Started { index: usize, note: String },
+    Started {
+        index: usize,
+        note: String,
+    },
+    /// The agent was run in its pane's shell rather than by `agent start`.
+    Launched {
+        index: usize,
+    },
 }
 
 pub fn run(args: &[String]) -> Result<(), String> {
@@ -319,6 +347,7 @@ fn watch(
         while let Ok(event) = inbox.try_recv() {
             match event {
                 Event::Started { index, note } => herd.members[index].note = note,
+                Event::Launched { index } => herd.members[index].launched = Some(Instant::now()),
                 Event::Statuses(Err(err)) => error = err,
                 Event::Statuses(Ok(statuses)) => {
                     error.clear();
@@ -342,6 +371,20 @@ fn watch(
                                 herd.members[index].calm = 0;
                             }
                             Action::Notify(index) => fresh.push(index),
+                            Action::Reported(index) => {
+                                // Names make `herdr agent` commands find it.
+                                let (pane, name) = (
+                                    herd.members[index].pane.clone(),
+                                    herd.members[index].name.clone(),
+                                );
+                                let machine = options.machine.clone();
+                                thread::spawn(move || {
+                                    herdr::run_quietly_on(
+                                        Some(&machine),
+                                        &["agent", "rename", &pane, &name],
+                                    );
+                                });
+                            }
                         }
                     }
                     seat_waiting(herd, &options.machine, board);
@@ -516,7 +559,10 @@ fn spawn(options: &Options, events: &Sender<Event>) -> Result<(String, Vec<Membe
         let agent_args = options.agent_args.clone();
         let events = events.clone();
         thread::spawn(move || {
-            let note = match start_agent(&machine, &kind, &name, &pane, &agent_args) {
+            let launched = || {
+                let _ = events.send(Event::Launched { index });
+            };
+            let note = match start_agent(&machine, &kind, &name, &pane, &agent_args, launched) {
                 Ok(()) => String::new(),
                 Err(err) => err,
             };
@@ -532,6 +578,7 @@ fn start_agent(
     name: &str,
     pane: &str,
     agent_args: &[String],
+    launched: impl FnOnce(),
 ) -> Result<(), String> {
     let mut args = vec!["agent", "start", name, "--kind", kind, "--pane", pane];
     if !agent_args.is_empty() {
@@ -544,6 +591,11 @@ fn start_agent(
             Ok(_) => return Ok(()),
             // It started and is already asking something: the herd seats it.
             Err(err) if err.contains("agent_not_ready") => return Ok(()),
+            // Not a kind herdr starts itself (such as auggie, whose state a
+            // plugin reports): run it in the shell instead.
+            Err(err) if err.contains("unsupported interactive agent kind") => {
+                return run_agent(machine, kind, pane, agent_args, launched)
+            }
             // A new pane's shell may not be at its prompt yet.
             Err(_) if tries + 1 < START_TRIES => {
                 tries += 1;
@@ -552,6 +604,25 @@ fn start_agent(
             Err(err) => return Err(err),
         }
     }
+}
+
+/// Runs `kind` as a command in the pane's shell. The herd names the agent
+/// once it reports itself (see `name_reported`).
+fn run_agent(
+    machine: &str,
+    kind: &str,
+    pane: &str,
+    agent_args: &[String],
+    launched: impl FnOnce(),
+) -> Result<(), String> {
+    let command = std::iter::once(kind)
+        .chain(agent_args.iter().map(String::as_str))
+        .map(remote::shell_quote)
+        .collect::<Vec<_>>()
+        .join(" ");
+    herdr::run_on(Some(machine), &["pane", "run", pane, &command])?;
+    launched();
+    Ok(())
 }
 
 /// `count` agent names `<prefix>-<n>` not taken by a live agent on the machine.
@@ -649,7 +720,7 @@ fn draw(frame: &mut Frame, herd: &Herd, machine: &str, workspace: &str, error: &
     let waiting = herd.queue();
     for (index, member) in herd.members.iter().enumerate() {
         let style = match member.status.as_str() {
-            "blocked" => Style::new().red().bold(),
+            "blocked" | "startup" => Style::new().red().bold(),
             "working" => Style::new().yellow(),
             "idle" | "done" => Style::new().green(),
             _ => Style::new().dim(),
@@ -748,6 +819,32 @@ mod tests {
         assert_eq!(
             herd.observe(&statuses(&[("w1:p1", "working")]), &seated, now),
             []
+        );
+    }
+
+    #[test]
+    fn a_shell_run_agent_silent_at_startup_needs_input_until_it_reports() {
+        let mut herd = herd(1);
+        let start = Instant::now();
+        herd.members[0].launched = Some(start);
+        let silent = statuses(&[("w1:p1", "no agent")]);
+        assert_eq!(herd.observe(&silent, &open(&[]), start), []);
+        let later = start + UNREPORTED_AFTER;
+        assert_eq!(
+            herd.observe(&silent, &open(&[]), later),
+            [Action::Notify(0)]
+        );
+        assert_eq!(herd.members[0].status, "startup");
+        herd.members[0].seat = Some("wA:p9".into());
+        let idle = statuses(&[("w1:p1", "idle")]);
+        assert_eq!(
+            herd.observe(&idle, &open(&["wA:p9"]), later),
+            [Action::Reported(0)]
+        );
+        assert_eq!(herd.members[0].launched, None);
+        assert_eq!(
+            herd.observe(&idle, &open(&["wA:p9"]), later),
+            [Action::Close(0)]
         );
     }
 
