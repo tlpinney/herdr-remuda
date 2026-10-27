@@ -32,7 +32,7 @@ remuda views delete <name>        # only when the user asks
 
 ## Herds
 
-A *herd* is a named group of agents on one saved machine: one workspace there, labelled with the herd's name (`ops@ziggy`), one tab per agent, agents named `ops-1`, `ops-2`, …. This machine keeps the herds it watches in `herds.json` in the plugin state directory. The *board* (`remuda herd`) watches all of them: when an agent turns `blocked` (red), a driven mirror of it (a *seat*) opens in the board's tab with a Herdr toast; once the agent works again for ~2 s the seat closes. Up to `--seats` (default 3) seats open, splitting right while columns stay 70 wide, then down while panes stay 14 tall; the board stays top-left. The user answers agents in the seats.
+A *herd* is a named group of agents on one saved machine: one workspace there, labelled with the herd's name (`ops@ziggy`), one tab per agent, agents named `ops-1`, `ops-2`, …. This machine keeps the herds it watches in `herds.json` in the plugin state directory. The *board* (`remuda herd`) watches all of them: when an agent turns `blocked` (red), a driven mirror of it (a *seat*) opens in the board's tab with a Herdr toast; once the agent works again for ~2 s the seat closes. Seats tile a grid over the board's pane (or the `--beside` pane), which keeps the top-left cell: by default as many 70-wide columns as fit and 2 rows when both stay 24 tall (163×53 is 2×2, 3 seats). That pane's row fills first with side-by-side splits, then the row below; cells are equal. `--grid ROWSxCOLS` (or `grid` in `config.toml`) fixes the grid and `--seats N` caps the seats. The user answers agents in the seats.
 
 ### Manage herds
 
@@ -64,7 +64,7 @@ herdr pane run "$pane" "remuda herd"
 herdr pane read "$pane" --source visible     # what the board shows
 ```
 
-To have seats open in the user's current tab instead (one at a time, beside their pane), keep the board in its own tab and point it at their pane: `remuda herd --beside "$HERDR_PANE_ID" --seats 1`. A seat there never takes focus from that pane.
+To have seats open in the user's current tab instead (one at a time, beside their pane), keep the board in its own tab and point it at their pane: `remuda herd --beside "$HERDR_PANE_ID"` (add `--seats 1` for one at a time). A seat there never takes focus from that pane.
 
 `q` on the board closes it and its seats; the agents keep running. A herd's workspace stays on its machine until closed. Stop only herds you started, and only once the user is done: `remuda herd stop ops@ziggy` closes the herd's workspace, ending its agents, and forgets it.
 

@@ -3,6 +3,8 @@
 //! ```toml
 //! # How this machine appears on panes it mirrors (default: the host name).
 //! name = "travis-air"
+//! # The herd board's seat grid, ROWSxCOLS (default: what fits the screen).
+//! grid = "2x4"
 //! ```
 
 use std::path::PathBuf;
@@ -16,6 +18,8 @@ use crate::herdr;
 pub struct Config {
     #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
+    pub grid: Option<String>,
 }
 
 impl Config {

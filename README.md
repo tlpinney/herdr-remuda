@@ -66,10 +66,10 @@ herdr plugin link .
 remuda herd new ops@ziggy --count 3 --cwd ~/code/project   # start 3 Claude agents: ops-1…ops-3
 remuda herd new aug@ziggy --count 2 --kind auggie          # another herd, of auggie agents
 remuda herd                                                # the board, in the pane you run it in
-remuda herd --beside wA:p7 --seats 1                       # seats open beside pane wA:p7, one at a time
+remuda herd --beside wA:p7 --grid 2x4                      # seats open in a 2×4 grid around pane wA:p7
 ```
 
-The board watches every herd this machine knows. When an agent turns blocked (red), a driven mirror of it (a seat) opens in this tab and Herdr shows a toast. Answer it there; once the agent is working again for a moment, the seat closes and frees its place. At most 3 seats open at once (`--seats`), as many as fit: they split right while columns stay 70 wide, then down while panes stay 14 tall, so the board stays top-left. Blocked agents with no free seat wait in line, longest-waiting first. Closing a seat yourself (`ctrl+]`) leaves that agent alone until it asks again. `q` closes the board and its seats; the agents keep running.
+The board watches every herd this machine knows. When an agent turns blocked (red), a driven mirror of it (a seat) opens in this tab and Herdr shows a toast. Answer it there; once the agent is working again for a moment, the seat closes and frees its place. Seats tile a grid over the board's pane (or the `--beside` pane), which keeps the top-left cell: by default as many columns at least 70 wide as fit, and 2 rows when both stay at least 24 tall, so a 163×53 tab is 2×2 (3 seats) and a wider monitor 2×3, 2×4 or 2×5. The row of that pane fills first, left to right, then the row below; every cell gets the same size. Set the grid with `--grid ROWSxCOLS` or `grid = "2x4"` in `config.toml`, and cap the seats with `--seats N`. Blocked agents with no free seat wait in line, longest-waiting first. Closing a seat yourself (`ctrl+]`) leaves that agent alone until it asks again. `q` closes the board and its seats; the agents keep running.
 
 Change a herd while the board runs; it reads each herd's workspace on every poll:
 
@@ -98,7 +98,7 @@ From a shell inside Herdr:
 
 ```bash
 remuda view --source w9:p1 --machine ziggy --mode control --size follow
-remuda herd [--seats 3] [--beside PANE]
+remuda herd [--grid ROWSxCOLS] [--seats N] [--beside PANE]
 remuda herd new|add <herd>@<machine> [--count N] [--kind claude] [--cwd DIR] [-- AGENT_ARGS]
 remuda herd remove <herd>@<machine> <agent>
 remuda herd adopt <herd>@<machine> <workspace> | forget|stop <herd>@<machine> | list
@@ -126,6 +126,8 @@ npx skills add tlpinney/remuda --skill remuda -g
 ```toml
 # How this machine appears on panes it mirrors (default: the host name).
 name = "travis-air"
+# The herd board's seat grid, ROWSxCOLS (default: what fits the screen).
+grid = "2x4"
 ```
 
 ## How it works
