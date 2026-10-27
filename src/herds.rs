@@ -105,6 +105,8 @@ pub struct Seen {
     pub status: String,
     /// When remuda ran the agent in the shell, until it first reports.
     pub launched: Option<u64>,
+    /// The pane's terminal title: agents set it to what they are doing.
+    pub title: String,
 }
 
 /// The members of `workspace` in a machine's `pane list`: agent panes, and
@@ -137,6 +139,12 @@ pub fn members(listed: &Value, workspace: &str) -> Vec<Seen> {
                 launched: tokens[TOKEN_LAUNCHED]
                     .as_str()
                     .and_then(|at| at.parse().ok()),
+                title: pane["terminal_title_stripped"]
+                    .as_str()
+                    .or_else(|| pane["title"].as_str())
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string(),
             })
         })
         .collect()

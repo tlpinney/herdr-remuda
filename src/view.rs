@@ -469,8 +469,12 @@ impl Mirror {
             &config.machine_name(),
             spec.mode,
         );
+        // Why this mirror was opened, e.g. by the herd board.
+        let reason = std::env::var("REMUDA_NOTE").unwrap_or_default();
         let note = if let Some(err) = config_error {
             err
+        } else if !reason.trim().is_empty() {
+            reason.trim().to_string()
         } else if resumable || reporter.is_none() {
             String::new()
         } else {

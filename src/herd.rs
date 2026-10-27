@@ -41,6 +41,33 @@ const MAX_ROWS: u64 = 2;
 /// treats it as waiting at a startup prompt.
 const UNREPORTED_AFTER: u64 = 8;
 
+/// Why an agent wants a seat. The order is the queue's: questions before
+/// finished work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Reason {
+    /// Waiting on a question or an approval (or a startup screen).
+    Blocked,
+    /// Finished a turn nobody has looked at yet.
+    Review,
+}
+
+impl Reason {
+    fn of(status: &str) -> Option<Reason> {
+        match status {
+            "blocked" | "startup" => Some(Reason::Blocked),
+            "done" => Some(Reason::Review),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Reason::Blocked => "needs input",
+            Reason::Review => "finished · review",
+        }
+    }
+}
+
 struct Member {
     machine: String,
     /// The agent's pane on `machine`.
@@ -50,13 +77,16 @@ struct Member {
     name: String,
     status: String,
     note: String,
-    /// When the current blocked spell began; orders the queue for seats.
-    blocked_since: Option<Instant>,
+    /// What the agent is doing, from its terminal title.
+    context: String,
+    /// Why it wants a seat now, and since when; orders the queue.
+    reason: Option<Reason>,
+    since: Option<Instant>,
     /// The local mirror pane showing this agent.
     seat: Option<String>,
     calm: u8,
-    /// The user closed this agent's seat while it was blocked: leave it until
-    /// it is blocked again.
+    /// The user closed this agent's seat while it wanted one: leave it until
+    /// it wants one for another reason, or again after not wanting one.
     waived: bool,
     /// Already named after its first report, for agents run in the shell.
     reported: bool,
@@ -71,7 +101,9 @@ impl Member {
             name: seen.name.clone(),
             status: "starting".into(),
             note: String::new(),
-            blocked_since: None,
+            context: seen.title.clone(),
+            reason: None,
+            since: None,
             seat: None,
             calm: 0,
             waived: false,
@@ -98,7 +130,7 @@ struct Poll {
 enum Action {
     /// Close this member's seat: its agent no longer needs input.
     Close(usize),
-    /// This member just turned blocked.
+    /// This member just started wanting a seat, or for a new reason.
     Notify(usize),
     /// This member, run in the shell, just reported itself to herdr.
     Reported(usize),
@@ -155,6 +187,7 @@ impl Board {
                 Some((herd, agent)) => {
                     member.herd = herd.to_string();
                     member.name = agent.name.clone();
+                    member.context = agent.title.clone();
                     agent.status.clone()
                 }
                 None if poll.watched.contains(&member.machine)
@@ -173,7 +206,7 @@ impl Board {
                 member.reported = true;
                 actions.push(Action::Reported(index));
             }
-            let blocked = matches!(status.as_str(), "blocked" | "startup");
+            let want = Reason::of(&status);
             if member
                 .seat
                 .as_ref()
@@ -182,21 +215,28 @@ impl Board {
                 // Closed by the user (ctrl+]).
                 member.seat = None;
                 member.calm = 0;
-                member.waived = blocked;
+                member.waived = want.is_some();
             }
-            if blocked {
-                member.calm = 0;
-                if member.blocked_since.is_none() {
-                    member.blocked_since = Some(now);
-                    actions.push(Action::Notify(index));
+            match want {
+                Some(reason) => {
+                    member.calm = 0;
+                    // A review that turns into a question keeps its seat.
+                    if member.reason != Some(reason) {
+                        member.reason = Some(reason);
+                        member.since = Some(now);
+                        member.waived = false;
+                        actions.push(Action::Notify(index));
+                    }
                 }
-            } else {
-                member.blocked_since = None;
-                member.waived = false;
-                if member.seat.is_some() {
-                    member.calm += 1;
-                    if member.calm >= CALM_POLLS || status == "gone" {
-                        actions.push(Action::Close(index));
+                None => {
+                    member.reason = None;
+                    member.since = None;
+                    member.waived = false;
+                    if member.seat.is_some() {
+                        member.calm += 1;
+                        if member.calm >= CALM_POLLS || status == "gone" {
+                            actions.push(Action::Close(index));
+                        }
                     }
                 }
             }
@@ -211,17 +251,18 @@ impl Board {
             .retain(|m| m.status != "gone" || m.seat.is_some());
     }
 
-    /// Members waiting for a seat, longest-waiting first.
+    /// Members waiting for a seat: questions first, then finished work, each
+    /// longest-waiting first.
     fn queue(&self) -> Vec<usize> {
-        let mut waiting: Vec<(Instant, usize)> = self
+        let mut waiting: Vec<(Reason, Instant, usize)> = self
             .members
             .iter()
             .enumerate()
             .filter(|(_, m)| m.seat.is_none() && !m.waived)
-            .filter_map(|(index, m)| Some((m.blocked_since?, index)))
+            .filter_map(|(index, m)| Some((m.reason?, m.since?, index)))
             .collect();
         waiting.sort();
-        waiting.into_iter().map(|(_, index)| index).collect()
+        waiting.into_iter().map(|(_, _, index)| index).collect()
     }
 
     fn seated(&self) -> usize {
@@ -734,6 +775,7 @@ fn open_seat(
     let plugin = herdr::plugin_id();
     let source = format!("REMUDA_SOURCE={}", member.pane);
     let machine = format!("REMUDA_MACHINE={}", member.machine);
+    let note = format!("REMUDA_NOTE={}", seat_note(member));
     let args = [
         "plugin",
         "pane",
@@ -757,6 +799,8 @@ fn open_seat(
         "REMUDA_MODE=control",
         "--env",
         "REMUDA_SIZE=follow",
+        "--env",
+        &note,
     ];
     let result = herdr::json(&args, None)?;
     result["plugin_pane"]["pane"]["pane_id"]
@@ -765,11 +809,28 @@ fn open_seat(
         .ok_or_else(|| "herdr did not say which pane it opened".into())
 }
 
+/// What a seat's bar says about why it opened: `finished · review: Fix the
+/// login test`.
+fn seat_note(member: &Member) -> String {
+    let reason = member.reason.map(Reason::label).unwrap_or_default();
+    match truncate(&member.context, 60) {
+        context if context.is_empty() => reason.to_string(),
+        context => format!("{reason}: {context}"),
+    }
+}
+
 fn notify(member: &Member) {
-    let title = format!("{} needs input", member.name);
-    let body = match member.seat {
-        Some(_) => format!("{} · opened beside the board", member.herd),
-        None => format!("{} · waiting for a free seat", member.herd),
+    let (title, sound) = match member.reason {
+        Some(Reason::Review) => (format!("{} finished", member.name), "done"),
+        _ => (format!("{} needs input", member.name), "request"),
+    };
+    let place = match member.seat {
+        Some(_) => "opened beside the board",
+        None => "waiting for a free seat",
+    };
+    let body = match truncate(&member.context, 60) {
+        context if context.is_empty() => format!("{} · {place}", member.herd),
+        context => format!("{} · {context} · {place}", member.herd),
     };
     thread::spawn(move || {
         herdr::run_quietly(&[
@@ -779,7 +840,7 @@ fn notify(member: &Member) {
             "--body",
             &body,
             "--sound",
-            "request",
+            sound,
         ]);
     });
 }
@@ -865,16 +926,21 @@ fn draw(frame: &mut Frame, state: &Board, poll: &Poll, polled: bool) {
 fn member_line(member: &Member, waiting: Option<usize>) -> Line<'static> {
     let style = match member.status.as_str() {
         "blocked" | "startup" => Style::new().red().bold(),
+        "done" => Style::new().cyan().bold(),
         "working" => Style::new().yellow(),
-        "idle" | "done" => Style::new().green(),
+        "idle" => Style::new().green(),
         _ => Style::new().dim(),
     };
+    let reason = member.reason.map(Reason::label).unwrap_or_default();
     let place = if member.seat.is_some() {
-        "▸ open".to_string()
+        format!("▸ open · {reason}")
     } else if let Some(position) = waiting {
-        format!("waiting #{}", position + 1)
+        format!("waiting #{} · {reason}", position + 1)
     } else if member.waived {
-        "closed until it asks again".into()
+        match member.reason {
+            Some(Reason::Review) => "reviewed".into(),
+            _ => "closed until it asks again".into(),
+        }
     } else {
         String::new()
     };
@@ -883,6 +949,9 @@ fn member_line(member: &Member, waiting: Option<usize>) -> Line<'static> {
         Span::styled(format!("{:<9} ", member.status), style),
         Span::from(place).bold(),
     ];
+    if !member.context.is_empty() {
+        spans.push(Span::from(format!("  {}", truncate(&member.context, 50))).dim());
+    }
     if !member.note.is_empty() {
         spans.push(Span::from(format!("  {}", member.note)).red());
     }
@@ -906,6 +975,7 @@ mod tests {
             name: format!("agent {pane}"),
             status: status.into(),
             launched: None,
+            title: String::new(),
         }
     }
 
@@ -963,6 +1033,68 @@ mod tests {
         board.observe(&three, &open(&[]), Instant::now(), 0);
         let panes: Vec<&str> = board.members.iter().map(|m| m.pane.as_str()).collect();
         assert_eq!(panes, ["w1:p1", "w1:p2", "w1:p3"]);
+    }
+
+    #[test]
+    fn finished_agents_wait_behind_questions_for_review() {
+        let mut board = board();
+        let now = Instant::now();
+        let first = board.observe(&poll(vec![seen("w1:p1", "done")]), &open(&[]), now, 0);
+        assert_eq!(first, [Action::Notify(0)]);
+        assert_eq!(board.members[0].reason, Some(Reason::Review));
+        let later = now + Duration::from_secs(5);
+        let both = poll(vec![seen("w1:p1", "done"), seen("w1:p2", "blocked")]);
+        assert_eq!(
+            board.observe(&both, &open(&[]), later, 0),
+            [Action::Notify(1)]
+        );
+        // The question was asked later, but goes first.
+        assert_eq!(board.queue(), [1, 0]);
+    }
+
+    #[test]
+    fn a_review_seat_closes_on_new_work_and_stays_for_a_question() {
+        let mut board = board();
+        let now = Instant::now();
+        board.observe(&poll(vec![seen("w1:p1", "done")]), &open(&[]), now, 0);
+        board.members[0].seat = Some("wA:p9".into());
+        let seated = open(&["wA:p9"]);
+        // The agent asks something while you review: same seat, new reason.
+        let asks = board.observe(&poll(vec![seen("w1:p1", "blocked")]), &seated, now, 0);
+        assert_eq!(asks, [Action::Notify(0)]);
+        assert_eq!(board.members[0].reason, Some(Reason::Blocked));
+        let working = poll(vec![seen("w1:p1", "working")]);
+        assert_eq!(board.observe(&working, &seated, now, 0), []);
+        assert_eq!(board.observe(&working, &seated, now, 0), [Action::Close(0)]);
+    }
+
+    #[test]
+    fn a_review_closed_by_hand_stays_closed_until_the_next_finish() {
+        let mut board = board();
+        let now = Instant::now();
+        let done = poll(vec![seen("w1:p1", "done")]);
+        board.observe(&done, &open(&[]), now, 0);
+        board.members[0].seat = Some("wA:p9".into());
+        board.observe(&done, &open(&[]), now, 0);
+        assert!(board.members[0].waived && board.queue().is_empty());
+        board.observe(&poll(vec![seen("w1:p1", "working")]), &open(&[]), now, 0);
+        assert_eq!(
+            board.observe(&done, &open(&[]), now, 0),
+            [Action::Notify(0)]
+        );
+        assert_eq!(board.queue(), [0]);
+    }
+
+    #[test]
+    fn seat_bars_say_why_they_opened() {
+        let mut board = board();
+        let mut agent = seen("w1:p1", "done");
+        agent.title = "Fix the login test".into();
+        board.observe(&poll(vec![agent]), &open(&[]), Instant::now(), 0);
+        assert_eq!(
+            seat_note(&board.members[0]),
+            "finished · review: Fix the login test"
+        );
     }
 
     #[test]
