@@ -267,24 +267,56 @@ fn place(layout: &Value, ours: &HashSet<String>) -> Option<(String, Direction)> 
 /// (`remuda herd --machine M …`), which starts or adopts a herd and watches it.
 pub fn run(args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
-        None => board(3),
-        Some("board") => board(parse_seats(&args[1..])?),
-        Some("--seats") => board(parse_seats(args)?),
+        None => board(BoardOptions::default()),
+        Some("board") => board(BoardOptions::parse(&args[1..])?),
+        Some("--seats" | "--beside") => board(BoardOptions::parse(args)?),
         Some(flag) if flag.starts_with("--") => one_shot(args),
         Some(command) => herds::command(command, &args[1..]),
     }
 }
 
-fn parse_seats(args: &[String]) -> Result<usize, String> {
-    match args {
-        [] => Ok(3),
-        [flag, value] if flag == "--seats" => value
-            .parse()
-            .ok()
-            .filter(|n| *n > 0)
-            .ok_or_else(|| "--seats needs a positive number".into()),
-        _ => Err(herds::USAGE.into()),
+#[derive(Debug, PartialEq, Eq)]
+struct BoardOptions {
+    seats: usize,
+    /// The pane seats open beside, in its own tab; the board's pane when
+    /// unset.
+    beside: Option<String>,
+}
+
+impl Default for BoardOptions {
+    fn default() -> BoardOptions {
+        BoardOptions {
+            seats: 3,
+            beside: None,
+        }
     }
+}
+
+impl BoardOptions {
+    /// `[--seats N] [--beside PANE]`.
+    fn parse(args: &[String]) -> Result<BoardOptions, String> {
+        let mut options = BoardOptions::default();
+        let mut args = args.iter();
+        while let Some(flag) = args.next() {
+            let value = args
+                .next()
+                .ok_or_else(|| format!("{flag} needs a value\n{}", herds::USAGE))?;
+            match flag.as_str() {
+                "--seats" => options.seats = parse_seats(value)?,
+                "--beside" => options.beside = Some(value.clone()),
+                _ => return Err(herds::USAGE.into()),
+            }
+        }
+        Ok(options)
+    }
+}
+
+fn parse_seats(value: &str) -> Result<usize, String> {
+    value
+        .parse()
+        .ok()
+        .filter(|n| *n > 0)
+        .ok_or_else(|| "--seats needs a positive number".into())
 }
 
 /// `remuda herd --machine M [--count N] [--kind K] [--cwd D] [--name H]
@@ -310,7 +342,7 @@ fn one_shot(args: &[String]) -> Result<(), String> {
         match flag.as_str() {
             "--machine" => machine = Some(value),
             "--name" => name = value,
-            "--seats" => seats = parse_seats(&["--seats".into(), value])?,
+            "--seats" => seats = parse_seats(&value)?,
             "--workspace" => workspace = Some(value),
             "--count" | "--kind" | "--cwd" => start_args.extend([flag.clone(), value]),
             _ => return Err(format!("unknown herd option {flag}\n{}", herds::USAGE)),
@@ -333,12 +365,21 @@ fn one_shot(args: &[String]) -> Result<(), String> {
             ))
         }
     }
-    board(seats)
+    board(BoardOptions {
+        seats,
+        beside: None,
+    })
 }
 
-fn board(max_seats: usize) -> Result<(), String> {
+fn board(options: BoardOptions) -> Result<(), String> {
     let board = std::env::var("HERDR_PANE_ID")
         .map_err(|_| "the herd board runs in a herdr pane (HERDR_PANE_ID is not set)")?;
+    // Seats split the anchor and each other: the board's own pane, or the
+    // pane given with --beside, in whatever tab that is.
+    let anchor = options.beside.unwrap_or_else(|| board.clone());
+    herdr::json(&["pane", "get", &anchor], None)
+        .map_err(|_| format!("no pane {anchor} here to open seats beside"))?;
+    let max_seats = options.seats;
     let (events, inbox) = mpsc::channel();
     spawn_poller(events);
     let mut terminal = ratatui::init();
@@ -346,7 +387,7 @@ fn board(max_seats: usize) -> Result<(), String> {
         members: Vec::new(),
         max_seats,
     };
-    let result = watch(&mut state, &board, &inbox, &mut terminal);
+    let result = watch(&mut state, &anchor, &board, &inbox, &mut terminal);
     ratatui::restore();
     for member in &state.members {
         if let Some(seat) = &member.seat {
@@ -359,6 +400,7 @@ fn board(max_seats: usize) -> Result<(), String> {
 
 fn watch(
     state: &mut Board,
+    anchor: &str,
     board: &str,
     inbox: &Receiver<Poll>,
     terminal: &mut ratatui::DefaultTerminal,
@@ -368,7 +410,7 @@ fn watch(
     loop {
         while let Ok(poll) = inbox.try_recv() {
             polled = true;
-            let layout = herdr::json(&["pane", "layout", "--pane", board], None)
+            let layout = herdr::json(&["pane", "layout", "--pane", anchor], None)
                 .map(|mut result| result["layout"].take())
                 .unwrap_or(Value::Null);
             let open: HashSet<String> = layout["panes"]
@@ -391,7 +433,7 @@ fn watch(
                     Action::Reported(index) => name_reported(&state.members[index]),
                 }
             }
-            seat_waiting(state, board);
+            seat_waiting(state, anchor, board);
             for index in fresh {
                 notify(&state.members[index]);
             }
@@ -429,13 +471,14 @@ fn name_reported(member: &Member) {
     });
 }
 
-/// Opens seats for waiting members while there are free seats and room.
-fn seat_waiting(state: &mut Board, board: &str) {
+/// Opens seats for waiting members while there are free seats and room in
+/// the anchor's tab.
+fn seat_waiting(state: &mut Board, anchor: &str, board: &str) {
     for index in state.queue() {
         if state.seated() >= state.max_seats {
             return;
         }
-        let Ok(mut layout) = herdr::json(&["pane", "layout", "--pane", board], None) else {
+        let Ok(mut layout) = herdr::json(&["pane", "layout", "--pane", anchor], None) else {
             return;
         };
         let layout = layout["layout"].take();
@@ -444,11 +487,12 @@ fn seat_waiting(state: &mut Board, board: &str) {
             .iter()
             .filter_map(|m| m.seat.clone())
             .collect();
-        ours.insert(board.to_string());
+        ours.insert(anchor.to_string());
         let Some((target, direction)) = place(&layout, &ours) else {
             return;
         };
-        // Take focus only from the board, never from a seat being typed in.
+        // Take focus only from the board, never from a seat being typed in
+        // or the pane seats open beside.
         let focus = layout["focused_pane_id"] == board;
         match open_seat(&state.members[index], &target, direction, focus) {
             Ok(seat) => state.members[index].seat = Some(seat),
@@ -797,11 +841,19 @@ mod tests {
     }
 
     #[test]
-    fn seats_option_needs_a_positive_number() {
+    fn board_options_take_seats_and_a_pane_to_open_them_beside() {
         let args = |list: &[&str]| list.iter().map(|a| a.to_string()).collect::<Vec<_>>();
-        assert_eq!(parse_seats(&[]).unwrap(), 3);
-        assert_eq!(parse_seats(&args(&["--seats", "2"])).unwrap(), 2);
-        assert!(parse_seats(&args(&["--seats", "0"])).is_err());
-        assert!(parse_seats(&args(&["--bogus"])).is_err());
+        assert_eq!(BoardOptions::parse(&[]).unwrap(), BoardOptions::default());
+        let options = BoardOptions::parse(&args(&["--beside", "wA:p7", "--seats", "1"])).unwrap();
+        assert_eq!(
+            options,
+            BoardOptions {
+                seats: 1,
+                beside: Some("wA:p7".into())
+            }
+        );
+        assert!(BoardOptions::parse(&args(&["--seats", "0"])).is_err());
+        assert!(BoardOptions::parse(&args(&["--seats"])).is_err());
+        assert!(BoardOptions::parse(&args(&["--bogus", "x"])).is_err());
     }
 }

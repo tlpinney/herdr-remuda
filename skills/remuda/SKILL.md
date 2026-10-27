@@ -64,6 +64,8 @@ herdr pane run "$pane" "remuda herd"
 herdr pane read "$pane" --source visible     # what the board shows
 ```
 
+To have seats open in the user's current tab instead (one at a time, beside their pane), keep the board in its own tab and point it at their pane: `remuda herd --beside "$HERDR_PANE_ID" --seats 1`. A seat there never takes focus from that pane.
+
 `q` on the board closes it and its seats; the agents keep running. A herd's workspace stays on its machine until closed. Stop only herds you started, and only once the user is done: `remuda herd stop ops@ziggy` closes the herd's workspace, ending its agents, and forgets it.
 
 ### Message agents

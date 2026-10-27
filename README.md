@@ -66,6 +66,7 @@ herdr plugin link .
 remuda herd new ops@ziggy --count 3 --cwd ~/code/project   # start 3 Claude agents: ops-1…ops-3
 remuda herd new aug@ziggy --count 2 --kind auggie          # another herd, of auggie agents
 remuda herd                                                # the board, in the pane you run it in
+remuda herd --beside wA:p7 --seats 1                       # seats open beside pane wA:p7, one at a time
 ```
 
 The board watches every herd this machine knows. When an agent turns blocked (red), a driven mirror of it (a seat) opens in this tab and Herdr shows a toast. Answer it there; once the agent is working again for a moment, the seat closes and frees its place. At most 3 seats open at once (`--seats`), as many as fit: they split right while columns stay 70 wide, then down while panes stay 14 tall, so the board stays top-left. Blocked agents with no free seat wait in line, longest-waiting first. Closing a seat yourself (`ctrl+]`) leaves that agent alone until it asks again. `q` closes the board and its seats; the agents keep running.
@@ -97,7 +98,7 @@ From a shell inside Herdr:
 
 ```bash
 remuda view --source w9:p1 --machine ziggy --mode control --size follow
-remuda herd [--seats 3]
+remuda herd [--seats 3] [--beside PANE]
 remuda herd new|add <herd>@<machine> [--count N] [--kind claude] [--cwd DIR] [-- AGENT_ARGS]
 remuda herd remove <herd>@<machine> <agent>
 remuda herd adopt <herd>@<machine> <workspace> | forget|stop <herd>@<machine> | list

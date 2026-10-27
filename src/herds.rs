@@ -445,7 +445,7 @@ pub fn command(command: &str, args: &[String]) -> Result<(), String> {
     }
 }
 
-pub const USAGE: &str = "usage: remuda herd [board] [--seats N]
+pub const USAGE: &str = "usage: remuda herd [board] [--seats N] [--beside PANE]
        remuda herd new <herd>@<machine> [--count 3] [--kind claude] [--cwd DIR] [-- AGENT_ARGS]
        remuda herd add <herd>@<machine> [--count 1] [--kind claude] [--cwd DIR] [-- AGENT_ARGS]
        remuda herd remove <herd>@<machine> <agent>
