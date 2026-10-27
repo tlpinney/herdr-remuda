@@ -69,7 +69,7 @@ remuda herd                                                # the board, in the p
 remuda herd --beside wA:p7 --seats 1                       # seats open beside pane wA:p7, one at a time
 ```
 
-The board watches every herd this machine knows. When an agent turns blocked (red), a driven mirror of it (a seat) opens in this tab and Herdr shows a toast. Answer it there; once the agent is working again for a moment, the seat closes and frees its place. At most 3 seats open at once (`--seats`), as many as fit: they split right while columns stay 70 wide, then down while panes stay 14 tall, so the board stays top-left. Blocked agents with no free seat wait in line, longest-waiting first. Closing a seat yourself (`ctrl+]`) leaves that agent alone until it asks again. `q` closes the board and its seats; the agents keep running.
+The board watches every herd this machine knows. When an agent turns blocked (red), a driven mirror of it (a seat) opens in this tab and Herdr shows a toast. Answer it there; once the agent is working again for a moment, the seat closes and frees its place. At most 3 seats open at once (`--seats`), as many as fit: they stack (split down) while panes stay 14 rows tall, then go side by side while columns stay 70 wide, so the board stays top-left. Blocked agents with no free seat wait in line, longest-waiting first. Closing a seat yourself (`ctrl+]`) leaves that agent alone until it asks again. `q` closes the board and its seats; the agents keep running.
 
 Change a herd while the board runs; it reads each herd's workspace on every poll:
 

@@ -32,7 +32,7 @@ remuda views delete <name>        # only when the user asks
 
 ## Herds
 
-A *herd* is a named group of agents on one saved machine: one workspace there, labelled with the herd's name (`ops@ziggy`), one tab per agent, agents named `ops-1`, `ops-2`, …. This machine keeps the herds it watches in `herds.json` in the plugin state directory. The *board* (`remuda herd`) watches all of them: when an agent turns `blocked` (red), a driven mirror of it (a *seat*) opens in the board's tab with a Herdr toast; once the agent works again for ~2 s the seat closes. Up to `--seats` (default 3) seats open, splitting right while columns stay 70 wide, then down while panes stay 14 tall; the board stays top-left. The user answers agents in the seats.
+A *herd* is a named group of agents on one saved machine: one workspace there, labelled with the herd's name (`ops@ziggy`), one tab per agent, agents named `ops-1`, `ops-2`, …. This machine keeps the herds it watches in `herds.json` in the plugin state directory. The *board* (`remuda herd`) watches all of them: when an agent turns `blocked` (red), a driven mirror of it (a *seat*) opens in the board's tab with a Herdr toast; once the agent works again for ~2 s the seat closes. Up to `--seats` (default 3) seats open, stacking (split down) while panes stay 14 rows tall, then side by side while columns stay 70 wide; the board, or the `--beside` pane, stays top-left. The user answers agents in the seats.
 
 ### Manage herds
 
