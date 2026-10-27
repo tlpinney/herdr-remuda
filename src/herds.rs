@@ -229,6 +229,60 @@ impl Start {
     }
 }
 
+/// The shell script that finds `cwd` on a machine: `~` is that machine's
+/// home, and a path under this machine's home (`local_home`, as a shell
+/// expands an unquoted `~/…` before remuda sees it) moves to the machine's
+/// home when only that exists. Prints the directory, `mapped <dir>`, or
+/// `missing <dir>`.
+fn cwd_script(cwd: &str, local_home: &str) -> String {
+    let (cwd, local) = (remote::shell_quote(cwd), remote::shell_quote(local_home));
+    format!(
+        r#"h=$HOME; d={cwd}; l={local}
+case "$d" in "~") d=$h;; "~/"*) d=$h/${{d#"~/"}};; esac
+if [ -d "$d" ]; then printf '%s\n' "$d"; exit 0; fi
+case "$d" in "$l"/*) m=$h/${{d#"$l"/}}; if [ "$l" != "$h" ] && [ -d "$m" ]; then printf 'mapped %s\n' "$m"; exit 0; fi;; esac
+printf 'missing %s\n' "$d""#
+    )
+}
+
+/// Reads `cwd_script`'s answer: the directory to use, and whether it moved.
+fn parse_cwd(output: &str, machine: &str) -> Result<(String, bool), String> {
+    let line = output.trim();
+    if let Some(dir) = line.strip_prefix("missing ") {
+        return Err(format!("no directory {dir} on {machine}"));
+    }
+    match line.strip_prefix("mapped ") {
+        Some(dir) => Ok((dir.to_string(), true)),
+        None if !line.is_empty() => Ok((line.to_string(), false)),
+        None => Err(format!("could not check the directory on {machine}")),
+    }
+}
+
+/// `start` with its directory resolved on `machine`.
+fn on_machine(start: &Start, machine: &str) -> Result<Start, String> {
+    let cwd = match &start.cwd {
+        None => None,
+        Some(cwd) => {
+            let local_home = std::env::var("HOME").unwrap_or_default();
+            let output = herdr::shell_on(machine, &cwd_script(cwd, &local_home))?;
+            let (dir, mapped) = parse_cwd(&output, machine)?;
+            if mapped {
+                println!(
+                    "{} {cwd} is under this machine's home; using {dir} on {machine}",
+                    herdr::MARK
+                );
+            }
+            Some(dir)
+        }
+    };
+    Ok(Start {
+        count: start.count,
+        kind: start.kind.clone(),
+        cwd,
+        agent_args: start.agent_args.clone(),
+    })
+}
+
 /// Creates the herd `name` on `machine` (a new workspace labelled `name`),
 /// registers it and starts its agents.
 pub fn create(name: &str, machine: &str, start: &Start) -> Result<Herd, String> {
@@ -239,6 +293,7 @@ pub fn create(name: &str, machine: &str, start: &Start) -> Result<Herd, String> 
     }
     herdr::machine_by_label(machine)
         .ok_or_else(|| format!("no enabled saved machine named {machine}"))?;
+    let start = &on_machine(start, machine)?;
     let mut create = vec!["workspace", "create", "--label", name, "--no-focus"];
     if let Some(cwd) = &start.cwd {
         create.extend(["--cwd", cwd]);
@@ -413,7 +468,8 @@ pub fn command(command: &str, args: &[String]) -> Result<(), String> {
         }
         ("add", [target, rest @ ..]) => {
             let herd = find_ref(target)?;
-            add_agents(&herd, &Start::parse(rest, 1)?, None)
+            let start = on_machine(&Start::parse(rest, 1)?, &herd.machine)?;
+            add_agents(&herd, &start, None)
         }
         ("remove", [target, agent]) => remove(&find_ref(target)?, agent),
         ("adopt", [target, workspace]) => adopt(target, workspace),
@@ -626,6 +682,55 @@ mod tests {
                 ("wR:p4", "codex wR:p4", "blocked", None),
             ]
         );
+    }
+
+    /// Runs `cwd_script` here with `$HOME` set to `home`.
+    fn find_dir(cwd: &str, home: &std::path::Path, local_home: &str) -> String {
+        let output = std::process::Command::new("sh")
+            .args(["-c", &cwd_script(cwd, local_home)])
+            .env("HOME", home)
+            .output()
+            .unwrap();
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    #[test]
+    fn directories_resolve_on_the_machine_with_its_own_home() {
+        let root = std::env::temp_dir().join(format!("remuda-cwd-{}", std::process::id()));
+        let home = root.join("remote");
+        std::fs::create_dir_all(home.join("code/today")).unwrap();
+        let home_text = home.display().to_string();
+        let today = format!("{home_text}/code/today");
+        assert_eq!(find_dir("~/code/today", &home, "/Users/me"), today);
+        assert_eq!(find_dir("~", &home, "/Users/me"), home_text);
+        assert_eq!(find_dir(&today, &home, "/Users/me"), today);
+        // A local shell turned ~/code/today into this machine's home.
+        assert_eq!(
+            find_dir("/Users/me/code/today", &home, "/Users/me"),
+            format!("mapped {today}")
+        );
+        assert_eq!(
+            find_dir("~/nope", &home, "/Users/me"),
+            format!("missing {home_text}/nope")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn directory_answers_parse_or_explain() {
+        assert_eq!(
+            parse_cwd("/h/x\n", "ziggy").unwrap(),
+            ("/h/x".into(), false)
+        );
+        assert_eq!(
+            parse_cwd("mapped /h/x", "ziggy").unwrap(),
+            ("/h/x".into(), true)
+        );
+        assert_eq!(
+            parse_cwd("missing /h/nope", "ziggy").unwrap_err(),
+            "no directory /h/nope on ziggy"
+        );
+        assert!(parse_cwd("", "ziggy").is_err());
     }
 
     #[test]
