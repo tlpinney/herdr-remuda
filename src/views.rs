@@ -75,12 +75,17 @@ impl SavedView {
     }
 }
 
-/// `$HERDR_PLUGIN_STATE_DIR/views`. Outside a plugin command (the CLI, or a
-/// mirror herdr resumed) this is the same directory, found the way herdr
-/// finds plugin state on unix: `$XDG_STATE_HOME/herdr/plugins/<id>` or
-/// `~/.local/state/herdr/plugins/<id>`.
+/// `$HERDR_PLUGIN_STATE_DIR/views`.
 pub fn views_dir() -> PathBuf {
-    let base = std::env::var_os("HERDR_PLUGIN_STATE_DIR")
+    state_dir().join("views")
+}
+
+/// `$HERDR_PLUGIN_STATE_DIR`. Outside a plugin command (the CLI, or a mirror
+/// herdr resumed) this is the same directory, found the way herdr finds
+/// plugin state on unix: `$XDG_STATE_HOME/herdr/plugins/<id>` or
+/// `~/.local/state/herdr/plugins/<id>`.
+pub fn state_dir() -> PathBuf {
+    std::env::var_os("HERDR_PLUGIN_STATE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             let state = std::env::var_os("XDG_STATE_HOME")
@@ -89,8 +94,7 @@ pub fn views_dir() -> PathBuf {
                     PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/state")
                 });
             state.join("herdr/plugins").join(herdr::plugin_id())
-        });
-    base.join("views")
+        })
 }
 
 /// The file name for a view: lowercase letters, digits and dashes.

@@ -1,12 +1,14 @@
-//! A herd: agents on a remote machine that come to you when they need input.
+//! The herd board: agents on remote machines that come to you when they need
+//! input.
 //!
-//! `remuda herd` starts agents on a saved machine, one tab each, or adopts the
-//! agents of a remote workspace, and turns the pane it runs in into a board of
-//! their states. When an agent turns `blocked`, the herd opens a driven mirror
-//! of it in this tab and shows a toast; once the agent is working again the
-//! mirror closes, freeing its seat for the next one. Seats split this tab
-//! right while the columns stay wide enough, then down, so the board stays in
-//! the top-left corner.
+//! `remuda herd` turns the pane it runs in into a board of every herd this
+//! machine watches (see `herds`). When an agent turns `blocked`, the board
+//! opens a driven mirror of it (a seat) in this tab and shows a toast; once
+//! the agent is working again the seat closes, freeing it for the next one.
+//! Seats split this tab right while the columns stay wide enough, then down,
+//! so the board stays in the top-left corner. Membership is read from each
+//! herd's workspace on every poll, so agents added to or removed from a herd
+//! come and go without restarting the board.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -21,8 +23,7 @@ use ratatui::Frame;
 use serde_json::Value;
 
 use crate::herdr::{self, MARK};
-use crate::remote;
-use crate::spec;
+use crate::herds::{self, Seen};
 
 const POLL: Duration = Duration::from_secs(1);
 const TICK: Duration = Duration::from_millis(200);
@@ -32,77 +33,17 @@ const CALM_POLLS: u8 = 2;
 /// The smallest seat worth opening; smaller panes would wrap the agent's UI.
 const MIN_COLS: u64 = 70;
 const MIN_ROWS: u64 = 14;
-/// Tries at `agent start` while a new pane's shell is still starting.
-const START_TRIES: u32 = 5;
-/// How long an agent run in the shell may stay unreported before the herd
+/// How long an agent run in the shell may stay unreported before the board
 /// treats it as waiting at a startup prompt.
-const UNREPORTED_AFTER: Duration = Duration::from_secs(8);
-
-struct Options {
-    machine: String,
-    count: usize,
-    kind: String,
-    cwd: Option<String>,
-    name: String,
-    seats: usize,
-    workspace: Option<String>,
-    agent_args: Vec<String>,
-}
-
-const USAGE: &str = "usage: remuda herd --machine NAME [--count 3] [--kind claude] [--cwd DIR] \
-[--name herd] [--seats 3] [--workspace ID] [-- AGENT_ARGS...]";
-
-impl Options {
-    fn parse(args: &[String]) -> Result<Options, String> {
-        let mut options = Options {
-            machine: String::new(),
-            count: 3,
-            kind: "claude".into(),
-            cwd: None,
-            name: "herd".into(),
-            seats: 3,
-            workspace: None,
-            agent_args: Vec::new(),
-        };
-        let mut args = args.iter();
-        while let Some(flag) = args.next() {
-            if flag == "--" {
-                options.agent_args = args.cloned().collect();
-                break;
-            }
-            let value = args
-                .next()
-                .ok_or_else(|| format!("{flag} needs a value\n{USAGE}"))?
-                .clone();
-            let number = |value: &str| {
-                value
-                    .parse::<usize>()
-                    .ok()
-                    .filter(|n| *n > 0)
-                    .ok_or_else(|| format!("{flag} needs a positive number"))
-            };
-            match flag.as_str() {
-                "--machine" => options.machine = value,
-                "--count" => options.count = number(&value)?,
-                "--kind" => options.kind = value,
-                "--cwd" => options.cwd = Some(value),
-                "--name" => options.name = value,
-                "--seats" => options.seats = number(&value)?,
-                "--workspace" => options.workspace = Some(value),
-                _ => return Err(format!("unknown herd option {flag}\n{USAGE}")),
-            }
-        }
-        if options.machine.is_empty() {
-            return Err(format!("no machine: pass --machine\n{USAGE}"));
-        }
-        Ok(options)
-    }
-}
+const UNREPORTED_AFTER: u64 = 8;
 
 struct Member {
-    name: String,
-    /// The agent's pane on the remote machine.
+    machine: String,
+    /// The agent's pane on `machine`.
     pane: String,
+    /// The herd's `name@machine`.
+    herd: String,
+    name: String,
     status: String,
     note: String,
     /// When the current blocked spell began; orders the queue for seats.
@@ -113,26 +54,40 @@ struct Member {
     /// The user closed this agent's seat while it was blocked: leave it until
     /// it is blocked again.
     waived: bool,
-    /// When the agent was run in the shell, until it reports itself to herdr.
-    /// Hook-reported agents (auggie) can stop at a startup prompt before
-    /// their first report, so a long silence counts as needing input.
-    launched: Option<Instant>,
+    /// Already named after its first report, for agents run in the shell.
+    reported: bool,
 }
 
 impl Member {
-    fn new(name: String, pane: String) -> Member {
+    fn new(machine: &str, herd: &str, seen: &Seen) -> Member {
         Member {
-            name,
-            pane,
+            machine: machine.to_string(),
+            pane: seen.pane.clone(),
+            herd: herd.to_string(),
+            name: seen.name.clone(),
             status: "starting".into(),
             note: String::new(),
             blocked_since: None,
             seat: None,
             calm: 0,
             waived: false,
-            launched: None,
+            reported: false,
         }
     }
+}
+
+/// One poll of every watched herd.
+#[derive(Default)]
+struct Poll {
+    /// Herd `name@machine`, its machine, and an agent in it.
+    seen: Vec<(String, String, Seen)>,
+    /// Machines that answered.
+    answered: HashSet<String>,
+    /// Machines with a watched herd.
+    watched: HashSet<String>,
+    /// Herds in the registry, in order, for the board's sections.
+    herds: Vec<String>,
+    errors: Vec<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -146,35 +101,67 @@ enum Action {
 }
 
 /// The seating rules, apart from herdr so they can be tested.
-struct Herd {
+struct Board {
     members: Vec<Member>,
     max_seats: usize,
 }
 
-impl Herd {
-    /// Takes in the agents' latest statuses (by remote pane id; a missing pane
-    /// is gone) and which local panes are still open.
+impl Board {
+    /// Takes in a poll and which local panes are still open. An agent missing
+    /// from a machine that answered has left its herd (or the herd was
+    /// forgotten); one on a machine that did not answer keeps its last state.
     fn observe(
         &mut self,
-        statuses: &HashMap<String, String>,
+        poll: &Poll,
         open: &HashSet<String>,
         now: Instant,
+        now_secs: u64,
     ) -> Vec<Action> {
+        let seen: HashMap<(&str, &str), (&str, &Seen)> = poll
+            .seen
+            .iter()
+            .map(|(herd, machine, seen)| {
+                (
+                    (machine.as_str(), seen.pane.as_str()),
+                    (herd.as_str(), seen),
+                )
+            })
+            .collect();
+        // New agents join in the order their machine lists them.
+        for (herd, machine, agent) in &poll.seen {
+            let known = self
+                .members
+                .iter()
+                .any(|m| m.machine == *machine && m.pane == agent.pane);
+            if !known {
+                self.members.push(Member::new(machine, herd, agent));
+            }
+        }
+
         let mut actions = Vec::new();
         for (index, member) in self.members.iter_mut().enumerate() {
-            let mut status = statuses
-                .get(&member.pane)
-                .cloned()
-                .unwrap_or_else(|| "gone".into());
-            if status != "no agent" {
-                if member.launched.take().is_some() && status != "gone" {
-                    actions.push(Action::Reported(index));
+            let found = seen.get(&(member.machine.as_str(), member.pane.as_str()));
+            let mut status = match found {
+                Some((herd, agent)) => {
+                    member.herd = herd.to_string();
+                    member.name = agent.name.clone();
+                    agent.status.clone()
                 }
-            } else if member
-                .launched
-                .is_some_and(|at| now.saturating_duration_since(at) >= UNREPORTED_AFTER)
-            {
-                status = "startup".into();
+                None if poll.watched.contains(&member.machine)
+                    && !poll.answered.contains(&member.machine) =>
+                {
+                    continue
+                }
+                None => "gone".into(),
+            };
+            let launched = found.and_then(|(_, agent)| agent.launched);
+            if status == "no agent" {
+                if launched.is_some_and(|at| now_secs.saturating_sub(at) >= UNREPORTED_AFTER) {
+                    status = "startup".into();
+                }
+            } else if launched.is_some() && status != "gone" && !member.reported {
+                member.reported = true;
+                actions.push(Action::Reported(index));
             }
             let blocked = matches!(status.as_str(), "blocked" | "startup");
             if member
@@ -206,6 +193,12 @@ impl Herd {
             member.status = status;
         }
         actions
+    }
+
+    /// Forgets members that left, once their seats are closed.
+    fn prune(&mut self) {
+        self.members
+            .retain(|m| m.status != "gone" || m.seat.is_some());
     }
 
     /// Members waiting for a seat, longest-waiting first.
@@ -270,132 +263,143 @@ fn place(layout: &Value, ours: &HashSet<String>) -> Option<(String, Direction)> 
         .map(|(id, _, _)| (id.to_string(), Direction::Down))
 }
 
-enum Event {
-    Statuses(Result<HashMap<String, String>, String>),
-    Started {
-        index: usize,
-        note: String,
-    },
-    /// The agent was run in its pane's shell rather than by `agent start`.
-    Launched {
-        index: usize,
-    },
+/// `remuda herd …`: the board, a herd command, or the original one-shot form
+/// (`remuda herd --machine M …`), which starts or adopts a herd and watches it.
+pub fn run(args: &[String]) -> Result<(), String> {
+    match args.first().map(String::as_str) {
+        None => board(3),
+        Some("board") => board(parse_seats(&args[1..])?),
+        Some("--seats") => board(parse_seats(args)?),
+        Some(flag) if flag.starts_with("--") => one_shot(args),
+        Some(command) => herds::command(command, &args[1..]),
+    }
 }
 
-pub fn run(args: &[String]) -> Result<(), String> {
-    let options = Options::parse(args)?;
-    let board = std::env::var("HERDR_PANE_ID")
-        .map_err(|_| "remuda herd runs in a herdr pane (HERDR_PANE_ID is not set)")?;
-    herdr::machine_by_label(&options.machine)
-        .ok_or_else(|| format!("no enabled saved machine named {}", options.machine))?;
-
-    let (events, inbox) = mpsc::channel();
-    let (workspace, members) = match &options.workspace {
-        Some(workspace) => (workspace.clone(), adopt(&options.machine, workspace)?),
-        None => {
-            eprintln!(
-                "{MARK} starting {} {} agents on {}…",
-                options.count, options.kind, options.machine
-            );
-            spawn(&options, &events)?
-        }
-    };
-    if members.is_empty() {
-        return Err(format!(
-            "no agents in workspace {workspace} on {}",
-            options.machine
-        ));
+fn parse_seats(args: &[String]) -> Result<usize, String> {
+    match args {
+        [] => Ok(3),
+        [flag, value] if flag == "--seats" => value
+            .parse()
+            .ok()
+            .filter(|n| *n > 0)
+            .ok_or_else(|| "--seats needs a positive number".into()),
+        _ => Err(herds::USAGE.into()),
     }
-    spawn_poller(options.machine.clone(), events);
+}
 
+/// `remuda herd --machine M [--count N] [--kind K] [--cwd D] [--name H]
+/// [--seats S] [--workspace W] [-- ARGS]`: starts herd `H` (default `herd`) on
+/// `M`, or adopts workspace `W` as it, then shows the board.
+fn one_shot(args: &[String]) -> Result<(), String> {
+    let mut machine = None;
+    let mut name = "herd".to_string();
+    let mut seats = 3;
+    let mut workspace = None;
+    let mut start_args = Vec::new();
+    let mut args = args.iter();
+    while let Some(flag) = args.next() {
+        if flag == "--" {
+            start_args.push(flag.clone());
+            start_args.extend(args.by_ref().cloned());
+            break;
+        }
+        let value = args
+            .next()
+            .ok_or_else(|| format!("{flag} needs a value"))?
+            .clone();
+        match flag.as_str() {
+            "--machine" => machine = Some(value),
+            "--name" => name = value,
+            "--seats" => seats = parse_seats(&["--seats".into(), value])?,
+            "--workspace" => workspace = Some(value),
+            "--count" | "--kind" | "--cwd" => start_args.extend([flag.clone(), value]),
+            _ => return Err(format!("unknown herd option {flag}\n{}", herds::USAGE)),
+        }
+    }
+    let machine = machine.ok_or_else(|| format!("no machine: pass --machine\n{}", herds::USAGE))?;
+    let target = format!("{name}@{machine}");
+    let registered = herds::find(&name, &machine);
+    match (&workspace, registered) {
+        (Some(workspace), Some(herd)) if herd.workspace == *workspace => {}
+        (Some(workspace), None) => herds::command("adopt", &[target, workspace.clone()])?,
+        (None, None) => {
+            let mut new_args = vec![target];
+            new_args.extend(start_args);
+            herds::command("new", &new_args)?;
+        }
+        (_, Some(_)) => {
+            return Err(format!(
+                "there is already a herd {target}; watch it with `remuda herd`, or add agents with `remuda herd add {target}`"
+            ))
+        }
+    }
+    board(seats)
+}
+
+fn board(max_seats: usize) -> Result<(), String> {
+    let board = std::env::var("HERDR_PANE_ID")
+        .map_err(|_| "the herd board runs in a herdr pane (HERDR_PANE_ID is not set)")?;
+    let (events, inbox) = mpsc::channel();
+    spawn_poller(events);
     let mut terminal = ratatui::init();
-    let mut herd = Herd {
-        members,
-        max_seats: options.seats,
+    let mut state = Board {
+        members: Vec::new(),
+        max_seats,
     };
-    let result = watch(
-        &mut herd,
-        &options,
-        &workspace,
-        &board,
-        &inbox,
-        &mut terminal,
-    );
+    let result = watch(&mut state, &board, &inbox, &mut terminal);
     ratatui::restore();
-    for member in &herd.members {
+    for member in &state.members {
         if let Some(seat) = &member.seat {
             herdr::run_quietly(&["pane", "close", seat]);
         }
     }
-    println!(
-        "{MARK} the herd keeps running on {}; watch it again with\n  remuda herd --machine {} --workspace {workspace}",
-        options.machine, options.machine
-    );
+    println!("{MARK} the herds keep running; `remuda herd` watches them again");
     result
 }
 
 fn watch(
-    herd: &mut Herd,
-    options: &Options,
-    workspace: &str,
+    state: &mut Board,
     board: &str,
-    inbox: &Receiver<Event>,
+    inbox: &Receiver<Poll>,
     terminal: &mut ratatui::DefaultTerminal,
 ) -> Result<(), String> {
-    let mut error = String::new();
+    let mut last = Poll::default();
+    let mut polled = false;
     loop {
-        while let Ok(event) = inbox.try_recv() {
-            match event {
-                Event::Started { index, note } => herd.members[index].note = note,
-                Event::Launched { index } => herd.members[index].launched = Some(Instant::now()),
-                Event::Statuses(Err(err)) => error = err,
-                Event::Statuses(Ok(statuses)) => {
-                    error.clear();
-                    let layout = herdr::json(&["pane", "layout", "--pane", board], None)
-                        .map(|mut result| result["layout"].take())
-                        .unwrap_or(Value::Null);
-                    let open: HashSet<String> = layout["panes"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|pane| pane["pane_id"].as_str().map(str::to_string))
-                        .collect();
-                    let actions = herd.observe(&statuses, &open, Instant::now());
-                    let mut fresh = Vec::new();
-                    for action in actions {
-                        match action {
-                            Action::Close(index) => {
-                                if let Some(seat) = herd.members[index].seat.take() {
-                                    herdr::run_quietly(&["pane", "close", &seat]);
-                                }
-                                herd.members[index].calm = 0;
-                            }
-                            Action::Notify(index) => fresh.push(index),
-                            Action::Reported(index) => {
-                                // Names make `herdr agent` commands find it.
-                                let (pane, name) = (
-                                    herd.members[index].pane.clone(),
-                                    herd.members[index].name.clone(),
-                                );
-                                let machine = options.machine.clone();
-                                thread::spawn(move || {
-                                    herdr::run_quietly_on(
-                                        Some(&machine),
-                                        &["agent", "rename", &pane, &name],
-                                    );
-                                });
-                            }
+        while let Ok(poll) = inbox.try_recv() {
+            polled = true;
+            let layout = herdr::json(&["pane", "layout", "--pane", board], None)
+                .map(|mut result| result["layout"].take())
+                .unwrap_or(Value::Null);
+            let open: HashSet<String> = layout["panes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|pane| pane["pane_id"].as_str().map(str::to_string))
+                .collect();
+            let actions = state.observe(&poll, &open, Instant::now(), herds::now_secs());
+            let mut fresh = Vec::new();
+            for action in actions {
+                match action {
+                    Action::Close(index) => {
+                        if let Some(seat) = state.members[index].seat.take() {
+                            herdr::run_quietly(&["pane", "close", &seat]);
                         }
+                        state.members[index].calm = 0;
                     }
-                    seat_waiting(herd, &options.machine, board);
-                    for index in fresh {
-                        notify(&herd.members[index], &options.machine);
-                    }
+                    Action::Notify(index) => fresh.push(index),
+                    Action::Reported(index) => name_reported(&state.members[index]),
                 }
             }
+            seat_waiting(state, board);
+            for index in fresh {
+                notify(&state.members[index]);
+            }
+            state.prune();
+            last = poll;
         }
         terminal
-            .draw(|frame| draw(frame, herd, &options.machine, workspace, &error))
+            .draw(|frame| draw(frame, state, &last, polled))
             .map_err(|err| format!("draw herd: {err}"))?;
         if event::poll(TICK).map_err(|err| format!("read key: {err}"))? {
             if let TermEvent::Key(key) = event::read().map_err(|err| format!("read key: {err}"))? {
@@ -411,28 +415,45 @@ fn watch(
     }
 }
 
+/// Names an agent run in the shell after its first report, so `herdr agent`
+/// commands find it, and drops its launch tag.
+fn name_reported(member: &Member) {
+    let (machine, pane, name) = (
+        member.machine.clone(),
+        member.pane.clone(),
+        member.name.clone(),
+    );
+    thread::spawn(move || {
+        herdr::run_quietly_on(Some(&machine), &["agent", "rename", &pane, &name]);
+        let _ = herds::tag(&machine, &pane, &[(herds::TOKEN_LAUNCHED, None)]);
+    });
+}
+
 /// Opens seats for waiting members while there are free seats and room.
-fn seat_waiting(herd: &mut Herd, machine: &str, board: &str) {
-    for index in herd.queue() {
-        if herd.seated() >= herd.max_seats {
+fn seat_waiting(state: &mut Board, board: &str) {
+    for index in state.queue() {
+        if state.seated() >= state.max_seats {
             return;
         }
         let Ok(mut layout) = herdr::json(&["pane", "layout", "--pane", board], None) else {
             return;
         };
         let layout = layout["layout"].take();
-        let mut ours: HashSet<String> =
-            herd.members.iter().filter_map(|m| m.seat.clone()).collect();
+        let mut ours: HashSet<String> = state
+            .members
+            .iter()
+            .filter_map(|m| m.seat.clone())
+            .collect();
         ours.insert(board.to_string());
         let Some((target, direction)) = place(&layout, &ours) else {
             return;
         };
         // Take focus only from the board, never from a seat being typed in.
         let focus = layout["focused_pane_id"] == board;
-        match open_seat(&herd.members[index], machine, &target, direction, focus) {
-            Ok(seat) => herd.members[index].seat = Some(seat),
+        match open_seat(&state.members[index], &target, direction, focus) {
+            Ok(seat) => state.members[index].seat = Some(seat),
             Err(err) => {
-                herd.members[index].note = err;
+                state.members[index].note = err;
                 return;
             }
         }
@@ -441,14 +462,13 @@ fn seat_waiting(herd: &mut Herd, machine: &str, board: &str) {
 
 fn open_seat(
     member: &Member,
-    machine: &str,
     target: &str,
     direction: Direction,
     focus: bool,
 ) -> Result<String, String> {
     let plugin = herdr::plugin_id();
     let source = format!("REMUDA_SOURCE={}", member.pane);
-    let machine = format!("REMUDA_MACHINE={machine}");
+    let machine = format!("REMUDA_MACHINE={}", member.machine);
     let args = [
         "plugin",
         "pane",
@@ -480,11 +500,11 @@ fn open_seat(
         .ok_or_else(|| "herdr did not say which pane it opened".into())
 }
 
-fn notify(member: &Member, machine: &str) {
+fn notify(member: &Member) {
     let title = format!("{} needs input", member.name);
     let body = match member.seat {
-        Some(_) => format!("{machine} · opened beside the herd"),
-        None => format!("{machine} · waiting for a free seat"),
+        Some(_) => format!("{} · opened beside the board", member.herd),
+        None => format!("{} · waiting for a free seat", member.herd),
     };
     thread::spawn(move || {
         herdr::run_quietly(&[
@@ -499,257 +519,100 @@ fn notify(member: &Member, machine: &str) {
     });
 }
 
-/// Creates a remote workspace with one tab per agent and starts the agents in
-/// the background; each start reports back as `Event::Started`.
-fn spawn(options: &Options, events: &Sender<Event>) -> Result<(String, Vec<Member>), String> {
-    let machine = Some(options.machine.as_str());
-    let names = free_names(&options.name, options.count, machine)?;
-    let mut create = vec![
-        "workspace",
-        "create",
-        "--label",
-        &options.name,
-        "--no-focus",
-    ];
-    if let Some(cwd) = &options.cwd {
-        create.extend(["--cwd", cwd]);
-    }
-    let created = herdr::json(&create, machine)?;
-    let workspace = created["workspace"]["workspace_id"]
-        .as_str()
-        .ok_or("herdr did not say which workspace it created")?
-        .to_string();
-    let mut panes = vec![created["root_pane"]["pane_id"]
-        .as_str()
-        .ok_or("herdr did not say which pane it created")?
-        .to_string()];
-    for name in &names[1..] {
-        let mut create = vec![
-            "tab",
-            "create",
-            "--workspace",
-            &workspace,
-            "--label",
-            name,
-            "--no-focus",
-        ];
-        if let Some(cwd) = &options.cwd {
-            create.extend(["--cwd", cwd]);
-        }
-        let created = herdr::json(&create, machine)?;
-        panes.push(
-            created["root_pane"]["pane_id"]
-                .as_str()
-                .ok_or("herdr did not say which pane it created")?
-                .to_string(),
-        );
-    }
-    let members: Vec<Member> = names
-        .into_iter()
-        .zip(panes)
-        .map(|(name, pane)| Member::new(name, pane))
-        .collect();
-    for (index, member) in members.iter().enumerate() {
-        let (machine, kind, name, pane) = (
-            options.machine.clone(),
-            options.kind.clone(),
-            member.name.clone(),
-            member.pane.clone(),
-        );
-        let agent_args = options.agent_args.clone();
-        let events = events.clone();
-        thread::spawn(move || {
-            let launched = || {
-                let _ = events.send(Event::Launched { index });
-            };
-            let note = match start_agent(&machine, &kind, &name, &pane, &agent_args, launched) {
-                Ok(()) => String::new(),
-                Err(err) => err,
-            };
-            let _ = events.send(Event::Started { index, note });
-        });
-    }
-    Ok((workspace, members))
-}
-
-fn start_agent(
-    machine: &str,
-    kind: &str,
-    name: &str,
-    pane: &str,
-    agent_args: &[String],
-    launched: impl FnOnce(),
-) -> Result<(), String> {
-    let mut args = vec!["agent", "start", name, "--kind", kind, "--pane", pane];
-    if !agent_args.is_empty() {
-        args.push("--");
-        args.extend(agent_args.iter().map(String::as_str));
-    }
-    let mut tries = 0;
-    loop {
-        match herdr::json(&args, Some(machine)) {
-            Ok(_) => return Ok(()),
-            // It started and is already asking something: the herd seats it.
-            Err(err) if err.contains("agent_not_ready") => return Ok(()),
-            // Not a kind herdr starts itself (such as auggie, whose state a
-            // plugin reports): run it in the shell instead.
-            Err(err) if err.contains("unsupported interactive agent kind") => {
-                return run_agent(machine, kind, pane, agent_args, launched)
-            }
-            // A new pane's shell may not be at its prompt yet.
-            Err(_) if tries + 1 < START_TRIES => {
-                tries += 1;
-                thread::sleep(Duration::from_secs(1));
-            }
-            Err(err) => return Err(err),
-        }
-    }
-}
-
-/// Runs `kind` as a command in the pane's shell. The herd names the agent
-/// once it reports itself (see `name_reported`).
-fn run_agent(
-    machine: &str,
-    kind: &str,
-    pane: &str,
-    agent_args: &[String],
-    launched: impl FnOnce(),
-) -> Result<(), String> {
-    let command = std::iter::once(kind)
-        .chain(agent_args.iter().map(String::as_str))
-        .map(remote::shell_quote)
-        .collect::<Vec<_>>()
-        .join(" ");
-    herdr::run_on(Some(machine), &["pane", "run", pane, &command])?;
-    launched();
-    Ok(())
-}
-
-/// `count` agent names `<prefix>-<n>` not taken by a live agent on the machine.
-fn free_names(prefix: &str, count: usize, machine: Option<&str>) -> Result<Vec<String>, String> {
-    let listed = herdr::json(&["agent", "list"], machine)?;
-    let taken: HashSet<&str> = listed["agents"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|agent| agent["name"].as_str())
-        .collect();
-    Ok(pick_names(prefix, count, &taken))
-}
-
-fn pick_names(prefix: &str, count: usize, taken: &HashSet<&str>) -> Vec<String> {
-    (1..)
-        .map(|n| format!("{prefix}-{n}"))
-        .filter(|name| !taken.contains(name.as_str()))
-        .take(count)
-        .collect()
-}
-
-/// The agents already running in a remote workspace.
-fn adopt(machine: &str, workspace: &str) -> Result<Vec<Member>, String> {
-    let listed = herdr::json(&["pane", "list"], Some(machine))?;
-    // Pane infos carry the agent kind; live agent names come from `agent list`.
-    let agents = herdr::json(&["agent", "list"], Some(machine))?;
-    let names: HashMap<&str, &str> = agents["agents"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|agent| Some((agent["pane_id"].as_str()?, agent["name"].as_str()?)))
-        .collect();
-    Ok(listed["panes"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|pane| pane["workspace_id"] == workspace && !spec::is_mirror(pane))
-        .filter_map(|pane| {
-            let agent = pane["agent"].as_str().filter(|agent| !agent.is_empty())?;
-            let id = pane["pane_id"].as_str()?.to_string();
-            let name = match names.get(id.as_str()) {
-                Some(name) => name.to_string(),
-                None => format!("{agent} {id}"),
-            };
-            Some(Member::new(name, id))
-        })
-        .collect())
-}
-
-/// Polls the machine's panes for agent statuses, by pane id.
-fn spawn_poller(machine: String, events: Sender<Event>) {
+/// Polls every watched herd once a second, one `pane list` per machine.
+fn spawn_poller(events: Sender<Poll>) {
     thread::spawn(move || loop {
-        let statuses = herdr::json(&["pane", "list"], Some(&machine))
-            .map(|listed| statuses(&listed))
-            .map_err(|_| format!("{machine} not answering"));
-        if events.send(Event::Statuses(statuses)).is_err() {
+        let herds = herds::load();
+        let mut poll = Poll {
+            herds: herds.iter().map(herds::Herd::label).collect(),
+            ..Poll::default()
+        };
+        let mut machines: Vec<&str> = herds.iter().map(|h| h.machine.as_str()).collect();
+        machines.sort();
+        machines.dedup();
+        for machine in machines {
+            poll.watched.insert(machine.to_string());
+            let Ok(listed) = herdr::json(&["pane", "list"], Some(machine)) else {
+                poll.errors.push(format!("{machine} not answering"));
+                continue;
+            };
+            poll.answered.insert(machine.to_string());
+            for herd in herds.iter().filter(|h| h.machine == machine) {
+                for seen in herds::members(&listed, &herd.workspace) {
+                    poll.seen.push((herd.label(), machine.to_string(), seen));
+                }
+            }
+        }
+        if events.send(poll).is_err() {
             return;
         }
         thread::sleep(POLL);
     });
 }
 
-fn statuses(listed: &Value) -> HashMap<String, String> {
-    listed["panes"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|pane| {
-            let id = pane["pane_id"].as_str()?.to_string();
-            let agent = pane["agent"].as_str().unwrap_or_default();
-            let status = if agent.is_empty() {
-                "no agent"
-            } else {
-                pane["agent_status"].as_str().unwrap_or("unknown")
-            };
-            Some((id, status.to_string()))
-        })
-        .collect()
-}
-
-fn draw(frame: &mut Frame, herd: &Herd, machine: &str, workspace: &str, error: &str) {
+fn draw(frame: &mut Frame, state: &Board, poll: &Poll, polled: bool) {
     let mut lines = vec![
         Line::from(vec![
             Span::from(format!(" {MARK} remuda herd ")).bold(),
-            Span::from(format!(
-                "· {machine} {workspace} · seats {}/{}",
-                herd.seated(),
-                herd.max_seats
-            ))
-            .dim(),
+            Span::from(format!("· seats {}/{}", state.seated(), state.max_seats)).dim(),
         ]),
         Line::from(""),
     ];
-    let waiting = herd.queue();
-    for (index, member) in herd.members.iter().enumerate() {
-        let style = match member.status.as_str() {
-            "blocked" | "startup" => Style::new().red().bold(),
-            "working" => Style::new().yellow(),
-            "idle" | "done" => Style::new().green(),
-            _ => Style::new().dim(),
-        };
-        let place = if member.seat.is_some() {
-            "▸ open".to_string()
-        } else if let Some(position) = waiting.iter().position(|i| *i == index) {
-            format!("waiting #{}", position + 1)
-        } else if member.waived {
-            "closed until it asks again".into()
-        } else {
-            String::new()
-        };
-        let mut spans = vec![
-            Span::from(format!("  {:<16} ", truncate(&member.name, 16))),
-            Span::styled(format!("{:<9} ", member.status), style),
-            Span::from(place).bold(),
-        ];
-        if !member.note.is_empty() {
-            spans.push(Span::from(format!("  {}", member.note)).red());
-        }
-        lines.push(Line::from(spans));
+    if polled && poll.herds.is_empty() {
+        lines.push(Line::from(
+            "  no herds yet: remuda herd new <herd>@<machine> [--count 3] [--kind claude]",
+        ));
     }
-    lines.push(Line::from(""));
-    if !error.is_empty() {
+    let waiting = state.queue();
+    for herd in &poll.herds {
+        let count = state.members.iter().filter(|m| m.herd == *herd).count();
+        lines.push(Line::from(vec![
+            Span::from(format!(" {herd} ")).bold(),
+            Span::from(format!("· {}", herds::count_agents(count))).dim(),
+        ]));
+        for (index, member) in state.members.iter().enumerate() {
+            if member.herd != *herd {
+                continue;
+            }
+            lines.push(member_line(
+                member,
+                waiting.iter().position(|i| *i == index),
+            ));
+        }
+        lines.push(Line::from(""));
+    }
+    for error in &poll.errors {
         lines.push(Line::from(format!(" {error}")).red());
     }
     lines.push(Line::from(" q quit (agents keep running)").dim());
     frame.render_widget(Paragraph::new(lines), frame.area());
+}
+
+fn member_line(member: &Member, waiting: Option<usize>) -> Line<'static> {
+    let style = match member.status.as_str() {
+        "blocked" | "startup" => Style::new().red().bold(),
+        "working" => Style::new().yellow(),
+        "idle" | "done" => Style::new().green(),
+        _ => Style::new().dim(),
+    };
+    let place = if member.seat.is_some() {
+        "▸ open".to_string()
+    } else if let Some(position) = waiting {
+        format!("waiting #{}", position + 1)
+    } else if member.waived {
+        "closed until it asks again".into()
+    } else {
+        String::new()
+    };
+    let mut spans = vec![
+        Span::from(format!("  {:<16} ", truncate(&member.name, 16))),
+        Span::styled(format!("{:<9} ", member.status), style),
+        Span::from(place).bold(),
+    ];
+    if !member.note.is_empty() {
+        spans.push(Span::from(format!("  {}", member.note)).red());
+    }
+    Line::from(spans)
 }
 
 fn truncate(text: &str, width: usize) -> String {
@@ -761,19 +624,35 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn herd(count: usize) -> Herd {
-        Herd {
-            members: (1..=count)
-                .map(|n| Member::new(format!("herd-{n}"), format!("w1:p{n}")))
-                .collect(),
-            max_seats: 3,
+    const HERD: &str = "ops@ziggy";
+
+    fn seen(pane: &str, status: &str) -> Seen {
+        Seen {
+            pane: pane.into(),
+            name: format!("agent {pane}"),
+            status: status.into(),
+            launched: None,
         }
     }
 
-    fn statuses(list: &[(&str, &str)]) -> HashMap<String, String> {
-        list.iter()
-            .map(|(pane, status)| (pane.to_string(), status.to_string()))
-            .collect()
+    fn poll(agents: Vec<Seen>) -> Poll {
+        Poll {
+            seen: agents
+                .into_iter()
+                .map(|agent| (HERD.to_string(), "ziggy".to_string(), agent))
+                .collect(),
+            answered: HashSet::from(["ziggy".to_string()]),
+            watched: HashSet::from(["ziggy".to_string()]),
+            herds: vec![HERD.into()],
+            errors: Vec::new(),
+        }
+    }
+
+    fn board() -> Board {
+        Board {
+            members: Vec::new(),
+            max_seats: 3,
+        }
     }
 
     fn open(list: &[&str]) -> HashSet<String> {
@@ -781,95 +660,116 @@ mod tests {
     }
 
     #[test]
-    fn blocked_agents_queue_longest_waiting_first_and_notify_once() {
-        let mut herd = herd(3);
+    fn agents_join_as_they_appear_and_blocked_ones_queue_in_order() {
+        let mut board = board();
         let start = Instant::now();
+        let first = board.observe(&poll(vec![seen("w1:p2", "blocked")]), &open(&[]), start, 0);
+        assert_eq!(first, [Action::Notify(0)]);
         let later = start + Duration::from_secs(1);
-        let first = herd.observe(&statuses(&[("w1:p2", "blocked")]), &open(&[]), start);
-        assert_eq!(first, [Action::Notify(1)]);
-        let second = herd.observe(
-            &statuses(&[("w1:p1", "blocked"), ("w1:p2", "blocked")]),
-            &open(&[]),
-            later,
+        let both = poll(vec![seen("w1:p2", "blocked"), seen("w1:p1", "blocked")]);
+        assert_eq!(
+            board.observe(&both, &open(&[]), later, 0),
+            [Action::Notify(1)]
         );
-        assert_eq!(second, [Action::Notify(0)]);
-        assert_eq!(herd.queue(), [1, 0]);
+        assert_eq!(board.queue(), [0, 1]);
+        assert_eq!(board.members[1].herd, HERD);
+    }
+
+    #[test]
+    fn new_agents_join_in_the_order_their_machine_lists_them() {
+        let mut board = board();
+        let three = poll(vec![
+            seen("w1:p1", "idle"),
+            seen("w1:p2", "idle"),
+            seen("w1:p3", "idle"),
+        ]);
+        board.observe(&three, &open(&[]), Instant::now(), 0);
+        let panes: Vec<&str> = board.members.iter().map(|m| m.pane.as_str()).collect();
+        assert_eq!(panes, ["w1:p1", "w1:p2", "w1:p3"]);
     }
 
     #[test]
     fn a_seat_closes_once_its_agent_stays_out_of_blocked() {
-        let mut herd = herd(1);
+        let mut board = board();
         let now = Instant::now();
-        herd.observe(&statuses(&[("w1:p1", "blocked")]), &open(&[]), now);
-        herd.members[0].seat = Some("wA:p9".into());
-        let seated = open(&["wA:p9"]);
-        let working = statuses(&[("w1:p1", "working")]);
-        assert_eq!(herd.observe(&working, &seated, now), []);
-        assert_eq!(herd.observe(&working, &seated, now), [Action::Close(0)]);
-    }
-
-    #[test]
-    fn a_flicker_back_to_blocked_keeps_the_seat() {
-        let mut herd = herd(1);
-        let now = Instant::now();
-        herd.members[0].seat = Some("wA:p9".into());
-        let seated = open(&["wA:p9"]);
-        herd.observe(&statuses(&[("w1:p1", "working")]), &seated, now);
-        herd.observe(&statuses(&[("w1:p1", "blocked")]), &seated, now);
+        board.observe(&poll(vec![seen("w1:p1", "blocked")]), &open(&[]), now, 0);
+        board.members[0].seat = Some("wA:p9".into());
+        let working = poll(vec![seen("w1:p1", "working")]);
+        assert_eq!(board.observe(&working, &open(&["wA:p9"]), now, 0), []);
         assert_eq!(
-            herd.observe(&statuses(&[("w1:p1", "working")]), &seated, now),
-            []
-        );
-    }
-
-    #[test]
-    fn a_shell_run_agent_silent_at_startup_needs_input_until_it_reports() {
-        let mut herd = herd(1);
-        let start = Instant::now();
-        herd.members[0].launched = Some(start);
-        let silent = statuses(&[("w1:p1", "no agent")]);
-        assert_eq!(herd.observe(&silent, &open(&[]), start), []);
-        let later = start + UNREPORTED_AFTER;
-        assert_eq!(
-            herd.observe(&silent, &open(&[]), later),
-            [Action::Notify(0)]
-        );
-        assert_eq!(herd.members[0].status, "startup");
-        herd.members[0].seat = Some("wA:p9".into());
-        let idle = statuses(&[("w1:p1", "idle")]);
-        assert_eq!(
-            herd.observe(&idle, &open(&["wA:p9"]), later),
-            [Action::Reported(0)]
-        );
-        assert_eq!(herd.members[0].launched, None);
-        assert_eq!(
-            herd.observe(&idle, &open(&["wA:p9"]), later),
+            board.observe(&working, &open(&["wA:p9"]), now, 0),
             [Action::Close(0)]
         );
     }
 
     #[test]
-    fn a_gone_agent_closes_its_seat_at_once() {
-        let mut herd = herd(1);
-        herd.members[0].seat = Some("wA:p9".into());
-        let actions = herd.observe(&statuses(&[]), &open(&["wA:p9"]), Instant::now());
+    fn an_agent_that_leaves_its_herd_closes_its_seat_and_is_forgotten() {
+        let mut board = board();
+        let now = Instant::now();
+        board.observe(&poll(vec![seen("w1:p1", "blocked")]), &open(&[]), now, 0);
+        board.members[0].seat = Some("wA:p9".into());
+        let actions = board.observe(&poll(vec![]), &open(&["wA:p9"]), now, 0);
         assert_eq!(actions, [Action::Close(0)]);
-        assert_eq!(herd.members[0].status, "gone");
+        board.members[0].seat = None;
+        board.prune();
+        assert!(board.members.is_empty());
+    }
+
+    #[test]
+    fn a_machine_that_does_not_answer_keeps_its_agents() {
+        let mut board = board();
+        let now = Instant::now();
+        board.observe(&poll(vec![seen("w1:p1", "blocked")]), &open(&[]), now, 0);
+        let mut silent = poll(vec![]);
+        silent.answered.clear();
+        assert_eq!(board.observe(&silent, &open(&[]), now, 0), []);
+        board.prune();
+        assert_eq!(board.members[0].status, "blocked");
     }
 
     #[test]
     fn a_seat_the_user_closed_waits_until_the_agent_asks_again() {
-        let mut herd = herd(1);
+        let mut board = board();
         let now = Instant::now();
-        let blocked = statuses(&[("w1:p1", "blocked")]);
-        herd.observe(&blocked, &open(&[]), now);
-        herd.members[0].seat = Some("wA:p9".into());
-        herd.observe(&blocked, &open(&[]), now);
-        assert_eq!(herd.members[0].seat, None);
-        assert!(herd.queue().is_empty());
-        herd.observe(&statuses(&[("w1:p1", "working")]), &open(&[]), now);
-        assert_eq!(herd.observe(&blocked, &open(&[]), now), [Action::Notify(0)]);
-        assert_eq!(herd.queue(), [0]);
+        let blocked = poll(vec![seen("w1:p1", "blocked")]);
+        board.observe(&blocked, &open(&[]), now, 0);
+        board.members[0].seat = Some("wA:p9".into());
+        board.observe(&blocked, &open(&[]), now, 0);
+        assert_eq!(board.members[0].seat, None);
+        assert!(board.queue().is_empty());
+        board.observe(&poll(vec![seen("w1:p1", "working")]), &open(&[]), now, 0);
+        assert_eq!(
+            board.observe(&blocked, &open(&[]), now, 0),
+            [Action::Notify(0)]
+        );
+        assert_eq!(board.queue(), [0]);
+    }
+
+    #[test]
+    fn a_shell_run_agent_silent_at_startup_needs_input_until_it_reports() {
+        let mut board = board();
+        let now = Instant::now();
+        let mut silent = seen("w1:p1", "no agent");
+        silent.launched = Some(100);
+        let early = board.observe(
+            &poll(vec![silent]),
+            &open(&[]),
+            now,
+            100 + UNREPORTED_AFTER - 1,
+        );
+        assert_eq!(early, []);
+        let mut silent = seen("w1:p1", "no agent");
+        silent.launched = Some(100);
+        let late = board.observe(&poll(vec![silent]), &open(&[]), now, 100 + UNREPORTED_AFTER);
+        assert_eq!(late, [Action::Notify(0)]);
+        assert_eq!(board.members[0].status, "startup");
+        let mut reported = seen("w1:p1", "idle");
+        reported.launched = Some(100);
+        let first = board.observe(&poll(vec![reported]), &open(&[]), now, 200);
+        assert_eq!(first, [Action::Reported(0)]);
+        let mut again = seen("w1:p1", "idle");
+        again.launched = Some(100);
+        assert_eq!(board.observe(&poll(vec![again]), &open(&[]), now, 201), []);
     }
 
     fn layout(panes: &[(&str, u64, u64)]) -> Value {
@@ -897,22 +797,11 @@ mod tests {
     }
 
     #[test]
-    fn names_skip_live_agents() {
-        let taken = HashSet::from(["herd-1", "herd-3"]);
-        assert_eq!(
-            pick_names("herd", 3, &taken),
-            ["herd-2", "herd-4", "herd-5"]
-        );
-    }
-
-    #[test]
-    fn options_need_a_machine_and_pass_agent_args_through() {
+    fn seats_option_needs_a_positive_number() {
         let args = |list: &[&str]| list.iter().map(|a| a.to_string()).collect::<Vec<_>>();
-        assert!(Options::parse(&args(&["--count", "2"])).is_err());
-        let options =
-            Options::parse(&args(&["--machine", "ziggy", "--", "--model", "opus"])).unwrap();
-        assert_eq!(options.count, 3);
-        assert_eq!(options.agent_args, ["--model", "opus"]);
-        assert!(Options::parse(&args(&["--machine", "ziggy", "--seats", "0"])).is_err());
+        assert_eq!(parse_seats(&[]).unwrap(), 3);
+        assert_eq!(parse_seats(&args(&["--seats", "2"])).unwrap(), 2);
+        assert!(parse_seats(&args(&["--seats", "0"])).is_err());
+        assert!(parse_seats(&args(&["--bogus"])).is_err());
     }
 }

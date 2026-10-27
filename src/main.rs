@@ -2,7 +2,8 @@
 //!
 //! Subcommands:
 //!   view [options]           a mirror pane (options or REMUDA_* variables)
-//!   herd --machine NAME ...  remote agents that open here when they need input
+//!   herd [command] ...       named herds of remote agents, and their board
+//!   send AGENT[@MACHINE] ... a message typed into an agent once it is idle
 //!   pick                     the picker popup
 //!   save                     the "Save view" popup
 //!   open-popup <entrypoint>  open one of the plugin's popups (plugin actions)
@@ -15,6 +16,7 @@ mod context;
 mod geometry;
 mod herd;
 mod herdr;
+mod herds;
 mod input;
 mod install;
 mod pick;
@@ -22,6 +24,7 @@ mod presence;
 mod remote;
 mod report;
 mod save;
+mod send;
 mod spec;
 mod view;
 mod views;
@@ -39,6 +42,7 @@ fn main() -> ExitCode {
     let result = match command {
         "view" => view::run(rest),
         "herd" => herd::run(rest),
+        "send" => send::run(rest),
         "pick" => pick::run(),
         "save" => save::run(),
         "open-popup" => open_popup(rest),

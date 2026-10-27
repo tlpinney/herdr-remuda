@@ -6,7 +6,8 @@ A [Herdr](https://herdr.dev) plugin for picking the panes you want to work with,
 - **Resize policies.** When you drive a mirror you choose who sets the source's size: `follow` (your mirror), `source` (its own layout), `smallest` of the two, or `freeze` at the size it had.
 - **Saved views.** Arrange mirrors in a tab and save it under a name; reopen it later as a new tab with the same layout.
 - **Survives restarts and drops.** Herdr reopens mirrors after a server restart, and a mirror reconnects by itself after a network drop, sleep, or a remote restart.
-- **Herds.** Start several agents on a remote machine and keep working; each one opens beside you when it needs input, and goes away once you answer.
+- **Herds.** Named groups of agents on remote machines; each one opens beside you when it needs input, and goes away once you answer. Add and remove agents while they run.
+- **Messages.** Send an agent, or a whole herd, a message that it reads once it is idle.
 - **Shows who is watching.** The source machine's sidebar marks a mirrored agent, e.g. `claude ⇄ travis-air (control)`, and your sidebar lists the mirror with the source's state.
 
 It uses only Herdr's CLI and socket API (`terminal session observe` and `control`), so it needs no changes to Herdr, and nothing has to be installed on the machines you mirror from.
@@ -59,21 +60,48 @@ herdr plugin link .
 
 **In a mirror.** The bottom row says where the mirror comes from and how it runs. `ctrl+]` closes it. In a driven mirror, keys, the mouse wheel and clicks go to the source; Shift+Enter arrives as Escape-Enter, which agents such as Claude Code read as a new line.
 
-**Run a herd.** From a shell pane in Herdr:
+**Run herds.** A herd is a named group of agents on one saved machine: one workspace there, labelled with the herd's name, with one tab per agent. From a shell in Herdr:
 
 ```bash
-remuda herd --machine ziggy --count 3 --cwd ~/code/project
+remuda herd new ops@ziggy --count 3 --cwd ~/code/project   # start 3 Claude agents: ops-1…ops-3
+remuda herd new aug@ziggy --count 2 --kind auggie          # another herd, of auggie agents
+remuda herd                                                # the board, in the pane you run it in
 ```
 
-This starts 3 Claude Code agents (`herd-1`…`herd-3`) on ziggy, one tab each in a new `herd` workspace, and turns your pane into a board of their states. When an agent turns blocked (red), a driven mirror of it opens in this tab and Herdr shows a toast. Answer it there; once the agent is working again for a moment, the mirror closes and frees its seat. At most 3 seats open at once (`--seats`), as many as fit: they split right while columns stay 70 wide, then down while panes stay 14 tall, so the board stays top-left. Agents that are blocked with no free seat wait in line, longest-waiting first. Closing a seat yourself (`ctrl+]`) leaves that agent alone until it asks again.
+The board watches every herd this machine knows. When an agent turns blocked (red), a driven mirror of it (a seat) opens in this tab and Herdr shows a toast. Answer it there; once the agent is working again for a moment, the seat closes and frees its place. At most 3 seats open at once (`--seats`), as many as fit: they split right while columns stay 70 wide, then down while panes stay 14 tall, so the board stays top-left. Blocked agents with no free seat wait in line, longest-waiting first. Closing a seat yourself (`ctrl+]`) leaves that agent alone until it asks again. `q` closes the board and its seats; the agents keep running.
 
-`q` closes the board and its seats; the agents keep running, and `remuda herd --machine ziggy --workspace <id>` watches them again (it prints the id). `--kind` picks another agent, `--name` the name prefix, and arguments after `--` go to the agent. A kind Herdr cannot start itself, such as `auggie`, is run in the tab's shell, and its Herdr plugin (for auggie, [herdr-auggie](https://github.com/tlpinney/herdr-auggie)) must be installed on the machine to report its state. Until such an agent first reports, which can wait on a startup screen, the board shows it as `startup` after 8 seconds and gives it a seat.
+Change a herd while the board runs; it reads each herd's workspace on every poll:
+
+```bash
+remuda herd add ops@ziggy --count 2            # two more agents (ops-4, ops-5)
+remuda herd remove ops@ziggy ops-2             # move ops-2 to a workspace of its own; it keeps running
+remuda herd adopt old@ziggy wR                 # make an existing workspace a herd
+remuda herd forget ops@ziggy                   # stop watching it; its agents keep running
+remuda herd stop ops@ziggy                     # end its agents: closes the workspace, then forgets it
+remuda herd list                               # herds, their agents and states
+```
+
+`--kind` picks the agent, `--cwd` its directory on the machine, and arguments after `--` go to the agent. A kind Herdr cannot start itself, such as `auggie`, is run in the tab's shell, and its Herdr plugin (for auggie, [herdr-auggie](https://github.com/tlpinney/herdr-auggie)) must be installed on that machine to report its state. Until such an agent first reports, which can wait on a startup screen, the board shows it as `startup` after 8 seconds and gives it a seat. The herds this machine watches are kept in `herds.json` in the plugin state directory; `remuda herd --machine ziggy [--name ops] …` still starts a herd and opens the board in one step.
+
+**Message agents.** `remuda send` types a message into an agent once it is idle, after a `[from <sender>]` prefix so the agent can tell it from your own words:
+
+```bash
+remuda send ops-1@ziggy "rebase on main when you can"
+remuda send @ops@ziggy "status?"               # every agent in the herd
+echo "long text" | remuda send ops-1@ziggy
+```
+
+It waits up to 10 minutes for a busy or blocked agent (`--wait`), names the sender after the sending pane's agent (`--from` to override), and records every message in `messages.jsonl` in the plugin state directory. The prefix is a convention, not a proof: anything that can run `remuda send` can claim any sender.
 
 From a shell inside Herdr:
 
 ```bash
 remuda view --source w9:p1 --machine ziggy --mode control --size follow
-remuda herd --machine ziggy [--count 3] [--kind claude] [--cwd DIR] [--seats 3] [--workspace ID] [-- AGENT_ARGS]
+remuda herd [--seats 3]
+remuda herd new|add <herd>@<machine> [--count N] [--kind claude] [--cwd DIR] [-- AGENT_ARGS]
+remuda herd remove <herd>@<machine> <agent>
+remuda herd adopt <herd>@<machine> <workspace> | forget|stop <herd>@<machine> | list
+remuda send <agent>[@machine] | @<herd>@<machine> [--from NAME] [--wait SECONDS] [TEXT]
 remuda views list
 remuda views save <name> <tab_id>
 remuda views open <name> [--workspace <id>] [--no-focus]
