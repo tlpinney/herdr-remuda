@@ -447,6 +447,10 @@ struct Mirror {
     presence: Option<Presence>,
     /// The source agent last marked, and when, to pace refreshes.
     presence_mark: Option<(Option<String>, Instant)>,
+    /// Smooth scroll region slots the source's frames have declared and not
+    /// cleared (bit per slot). While any is active the host terminal sends
+    /// one wheel event per row, so the source scrolls one row per event.
+    smooth_slots: u8,
 }
 
 impl Mirror {
@@ -496,6 +500,7 @@ impl Mirror {
             resumable,
             presence: Some(presence),
             presence_mark: None,
+            smooth_slots: 0,
         };
         mirror.report(Some(source));
         Ok(mirror)
@@ -568,6 +573,7 @@ impl Mirror {
                 // A window drag sends a burst of these; act once it settles.
                 Ok(Event::Resized) => resize_due = Some(Instant::now() + RESIZE_SETTLE),
                 Ok(Event::Frame { generation, bytes }) if generation == self.generation => {
+                    track_smooth_slots(&mut self.smooth_slots, &bytes);
                     write_out(&bytes);
                     self.draw_status();
                 }
@@ -720,7 +726,7 @@ impl Mirror {
             input::MouseAction::WheelUp | input::MouseAction::WheelDown => json!({
                 "type": "terminal.scroll",
                 "direction": if mouse.action == input::MouseAction::WheelUp { "up" } else { "down" },
-                "lines": WHEEL_LINES,
+                "lines": if self.smooth_slots != 0 { 1 } else { WHEEL_LINES },
                 "source": "wheel",
                 "column": mouse.column,
                 "row": mouse.row,
@@ -759,6 +765,8 @@ impl Mirror {
         let previous = self.observe.take();
         let generation = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
         self.generation = generation;
+        // A new stream declares its regions afresh.
+        self.smooth_slots = 0;
         let spawned = herdr::stream_command(
             StreamKind::Observe,
             &self.spec.source,
@@ -849,6 +857,39 @@ impl Mirror {
 }
 
 /// Decodes observe frames into events until the stream closes.
+/// Follows the smooth scroll region declarations (`ESC _ smooth;… ESC \\`)
+/// that a herdr fork puts in each frame: `slot;top;bottom;left;right;pos;max`
+/// declares a slot, the legacy `top;bottom;pos;max` declares slot 0, `off;N`
+/// clears one and `off` clears all. Stock herdr sends none.
+fn track_smooth_slots(slots: &mut u8, bytes: &[u8]) {
+    const START: &[u8] = b"\x1b_smooth;";
+    let mut rest = bytes;
+    while let Some(at) = rest.windows(START.len()).position(|w| w == START) {
+        let body = &rest[at + START.len()..];
+        let Some(end) = body.windows(2).position(|w| w == b"\x1b\\") else {
+            return;
+        };
+        let payload = String::from_utf8_lossy(&body[..end]);
+        let fields: Vec<&str> = payload.split(';').collect();
+        match fields.as_slice() {
+            ["off"] => *slots = 0,
+            ["off", slot] => {
+                if let Ok(slot @ 0..=7) = slot.parse::<u8>() {
+                    *slots &= !(1 << slot);
+                }
+            }
+            [_, _, _, _] => *slots |= 1,
+            [slot, _, _, _, _, _, _] => {
+                if let Ok(slot @ 0..=7) = slot.parse::<u8>() {
+                    *slots |= 1 << slot;
+                }
+            }
+            _ => {}
+        }
+        rest = &body[end + 2..];
+    }
+}
+
 fn pump_observe(
     generation: u64,
     stdout: Option<impl Read>,
@@ -1061,6 +1102,21 @@ mod tests {
             MirrorSpec::from_tokens(&Value::Object(tokens)),
             Some(spec())
         );
+    }
+
+    #[test]
+    fn smooth_slots_follow_declarations_and_clears() {
+        let mut slots = 0;
+        track_smooth_slots(&mut slots, b"x\x1b_smooth;2;0;20;0;79;5;300\x1b\\y");
+        assert_eq!(slots, 0b100);
+        track_smooth_slots(&mut slots, b"\x1b_smooth;0;10;3;90\x1b\\");
+        assert_eq!(slots, 0b101);
+        track_smooth_slots(&mut slots, b"\x1b_smooth;off;2\x1b\\");
+        assert_eq!(slots, 0b001);
+        track_smooth_slots(&mut slots, b"\x1b_smooth;off\x1b\\");
+        assert_eq!(slots, 0);
+        track_smooth_slots(&mut slots, b"plain frame \x1b[2J no regions");
+        assert_eq!(slots, 0);
     }
 
     #[test]
