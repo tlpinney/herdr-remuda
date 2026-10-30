@@ -11,6 +11,12 @@
 //!
 //! When the master cannot be started, callers fall back to their old path, so
 //! a broken shared connection only costs speed.
+//!
+//! Herdr calls go one step further: the master forwards the machine's herdr
+//! API and client sockets to local sockets, and the local herdr CLI talks to
+//! them. Each call is then a forwarded channel instead of an SSH session
+//! running a remote shell and herdr, so sshd's `MaxSessions` (10 by default)
+//! no longer caps how many mirrors one machine can stream.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -110,6 +116,75 @@ impl Remote {
         started
     }
 
+    /// The local end of the machine's forwarded herdr API socket, forwarding
+    /// it first if needed, or `None` when it cannot be forwarded. The client
+    /// socket is forwarded beside it as `<name>-client.sock`, where herdr
+    /// derives it from `HERDR_SOCKET_PATH`.
+    pub fn forwarded_socket(&self) -> Option<PathBuf> {
+        let api = forwarded_api_socket(&self.socket);
+        // The master owns the listener, so a connection means it is up and
+        // forwarding. A stale socket file left by a dead master refuses.
+        if connects(&api) {
+            return Some(api);
+        }
+        if recently_failed(&api) || !self.connection_ready() {
+            return None;
+        }
+        let forwarded = self.forward(&api);
+        if !forwarded {
+            note_failure(&api);
+        }
+        forwarded.then_some(api)
+    }
+
+    fn forward(&self, api: &Path) -> bool {
+        let Some(_lock) = Lock::acquire(&self.socket.with_extension("forward.lock")) else {
+            return false;
+        };
+        if connects(api) {
+            return true;
+        }
+        let Some(remote_api) = self.remote_api_socket() else {
+            return false;
+        };
+        let client = forwarded_client_socket(api);
+        let remote_client = forwarded_client_socket(Path::new(&remote_api));
+        // ssh will not bind over the files a dead master left behind.
+        let _ = std::fs::remove_file(api);
+        let _ = std::fs::remove_file(&client);
+        Command::new("ssh")
+            .args(["-F", "/dev/null", "-o"])
+            .arg(format!("ControlPath={}", self.socket.display()))
+            .arg("-L")
+            .arg(format!("{}:{remote_api}", api.display()))
+            .arg("-L")
+            .arg(format!("{}:{}", client.display(), remote_client.display()))
+            .args(["-O", "forward", &self.target])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+            && connects(api)
+    }
+
+    /// The path of the herdr API socket for this machine's session, asked of
+    /// the herdr on the machine.
+    fn remote_api_socket(&self) -> Option<String> {
+        let herdr = std::env::var("REMUDA_REMOTE_HERDR").unwrap_or_else(|_| "herdr".into());
+        let script = format!("exec {} session list --json", shell_quote(&herdr));
+        let output = self
+            .script_via(&script, true, false)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        session_socket(&output.stdout, self.session.as_deref().unwrap_or("default"))
+    }
+
     fn remote_script(&self, args: &[&str]) -> String {
         let herdr = std::env::var("REMUDA_REMOTE_HERDR").unwrap_or_else(|_| "herdr".into());
         let mut words = vec![herdr];
@@ -174,6 +249,50 @@ impl Remote {
 fn socket_path(target: &str, session: Option<&str>) -> PathBuf {
     let key = format!("{target}\n{}", session.unwrap_or("default"));
     socket_dir().join(format!("{:016x}", fnv1a(key.as_bytes())))
+}
+
+/// Where the master forwards the machine's herdr API socket: beside its
+/// control socket, so it fits in 104 bytes too.
+fn forwarded_api_socket(control: &Path) -> PathBuf {
+    control.with_extension("sock")
+}
+
+/// Herdr's client socket for an API socket: `<dir>/<stem>-client.sock`.
+fn forwarded_client_socket(api: &Path) -> PathBuf {
+    let stem = api
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("herdr");
+    api.with_file_name(format!("{stem}-client.sock"))
+}
+
+/// The API socket of session `name` in `herdr session list --json` output.
+fn session_socket(json: &[u8], name: &str) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Sessions {
+        sessions: Vec<Session>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Session {
+        name: String,
+        socket_path: String,
+    }
+    serde_json::from_slice::<Sessions>(json)
+        .ok()?
+        .sessions
+        .into_iter()
+        .find(|session| session.name == name)
+        .map(|session| session.socket_path)
+}
+
+#[cfg(unix)]
+fn connects(socket: &Path) -> bool {
+    std::os::unix::net::UnixStream::connect(socket).is_ok()
+}
+
+#[cfg(not(unix))]
+fn connects(_socket: &Path) -> bool {
+    false
 }
 
 /// `/tmp/remuda-<uid>`, as herdr keeps its own SSH sockets in `/tmp/hssh-<uid>`.
@@ -300,6 +419,37 @@ mod tests {
             remote.remote_script(&["pane", "rename", "w1:p1", "it's mine"]),
             r"herdr --session agents pane rename w1:p1 'it'\''s mine'"
         );
+    }
+
+    #[test]
+    fn forwarded_sockets_sit_beside_the_control_socket_where_herdr_looks() {
+        let remote = Remote::new(&machine(None));
+        let api = forwarded_api_socket(&remote.socket);
+        assert_eq!(api.parent(), remote.socket.parent());
+        assert!(api.to_string_lossy().ends_with(".sock"));
+        let client = forwarded_client_socket(&api);
+        assert_eq!(client.parent(), api.parent());
+        assert!(client.to_string_lossy().ends_with("-client.sock"));
+        assert!(client.as_os_str().len() < 104);
+        assert_eq!(
+            forwarded_client_socket(Path::new("/home/me/.config/herdr/herdr.sock")),
+            Path::new("/home/me/.config/herdr/herdr-client.sock")
+        );
+    }
+
+    #[test]
+    fn session_socket_picks_the_named_session() {
+        let json = br#"{"sessions":[
+            {"default":true,"name":"default","running":true,"session_dir":"/h","socket_path":"/h/herdr.sock"},
+            {"default":false,"name":"agents","running":false,"session_dir":"/h/sessions/agents","socket_path":"/h/sessions/agents/herdr.sock"}
+        ]}"#;
+        assert_eq!(session_socket(json, "default").unwrap(), "/h/herdr.sock");
+        assert_eq!(
+            session_socket(json, "agents").unwrap(),
+            "/h/sessions/agents/herdr.sock"
+        );
+        assert_eq!(session_socket(json, "other"), None);
+        assert_eq!(session_socket(b"not json", "default"), None);
     }
 
     #[test]

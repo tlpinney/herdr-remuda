@@ -22,8 +22,9 @@ pub fn plugin_id() -> String {
 
 /// Runs a herdr CLI command, locally or on the saved machine `machine`.
 ///
-/// Remote commands go through the machine's shared SSH connection, falling
-/// back to `herdr --machine` when it is unavailable.
+/// Remote commands run the local herdr against the machine's forwarded
+/// socket, else the remote herdr over the machine's shared SSH connection,
+/// falling back to `herdr --machine` when neither is available.
 fn output(args: &[&str], machine: Option<&str>) -> Result<std::process::Output, String> {
     let mut command = match machine {
         None => {
@@ -32,8 +33,16 @@ fn output(args: &[&str], machine: Option<&str>) -> Result<std::process::Output, 
             command
         }
         Some(label) => match cached_machine(label).map(|machine| Remote::new(&machine)) {
-            Some(remote) if remote.connection_ready() => remote.herdr_command(args),
-            _ => {
+            Some(remote) => match remote.forwarded_socket() {
+                Some(socket) => forwarded_command(&socket, args),
+                None if remote.connection_ready() => remote.herdr_command(args),
+                None => {
+                    let mut command = Command::new(bin());
+                    command.args(["--machine", label]).args(args);
+                    command
+                }
+            },
+            None => {
                 let mut command = Command::new(bin());
                 command.args(["--machine", label]).args(args);
                 command
@@ -44,6 +53,20 @@ fn output(args: &[&str], machine: Option<&str>) -> Result<std::process::Output, 
         .stdin(Stdio::null())
         .output()
         .map_err(|err| format!("could not run herdr: {err}"))
+}
+
+/// The local herdr running `args` against a machine's forwarded API socket
+/// (and the client socket herdr derives from it). The `HERDR_*` variables of
+/// the pane remuda runs in name this herdr's panes and session, so none reach it.
+fn forwarded_command(socket: &std::path::Path, args: &[&str]) -> Command {
+    let mut command = Command::new(bin());
+    for (name, _) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("HERDR_") {
+            command.env_remove(name);
+        }
+    }
+    command.env("HERDR_SOCKET_PATH", socket).args(args);
+    command
 }
 
 /// Runs a herdr CLI command and returns its `result` object.
@@ -206,8 +229,9 @@ pub enum StreamKind {
 /// Builds the command for a `terminal session` stream.
 ///
 /// `--machine` does not forward interactive streams, so remote streams run the
-/// remote herdr over ssh against the machine's saved target and session,
-/// through its shared connection when that is up.
+/// local herdr against the machine's forwarded sockets, else the remote herdr
+/// over ssh against the machine's saved target and session, through its
+/// shared connection when that is up.
 pub fn stream_command(
     kind: StreamKind,
     source: &str,
@@ -243,6 +267,11 @@ pub fn stream_command(
         Some(machine) => {
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
             let remote = Remote::new(machine);
+            if let Some(socket) = remote.forwarded_socket() {
+                // Closing the local herdr closes its channel, so neither
+                // stream needs a terminal on the machine to hang up.
+                return forwarded_command(&socket, &args);
+            }
             match kind {
                 // Observe ignores its input, so only a hangup stops it on
                 // the machine; control ends when its input does.
