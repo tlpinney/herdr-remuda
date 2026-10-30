@@ -7,7 +7,7 @@
 set -eu
 
 tag="${1:?usage: sign-release.sh vX.Y.Z}"
-repo="tlpinney/remuda"
+repo="tlpinney/herdr-remuda"
 namespace="remuda-release"
 signer="tlpinney"
 key="${REMUDA_SIGNING_KEY:-$HOME/.ssh/id_ed25519}"

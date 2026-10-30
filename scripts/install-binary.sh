@@ -9,7 +9,7 @@
 # it builds from source instead. A failed verification stops the install.
 set -eu
 
-repo="tlpinney/remuda"
+repo="tlpinney/herdr-remuda"
 namespace="remuda-release"
 signer="tlpinney"
 dest="target/release/remuda"

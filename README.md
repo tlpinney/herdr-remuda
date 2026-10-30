@@ -22,7 +22,7 @@ It uses only Herdr's CLI and socket API (`terminal session observe` and `control
 ## Install
 
 ```bash
-herdr plugin install tlpinney/remuda
+herdr plugin install tlpinney/herdr-remuda
 ```
 
 Install downloads the prebuilt binary for your platform from the matching GitHub Release. It installs it only if the release's `SHA256SUMS` carries a valid signature from a key in [`signing/allowed_signers`](signing/allowed_signers) and the binary matches its checksum there; otherwise the install stops. If no release exists for that version, or `ssh-keygen` is missing, it builds from source instead, which needs a Rust toolchain (`cargo`).
@@ -114,7 +114,7 @@ remuda views delete <name>
 remuda ships a skill at [`skills/remuda/SKILL.md`](skills/remuda/SKILL.md) that teaches a coding agent running in a Herdr pane to open mirrors and views and to run herds. Install it the way Herdr's own skill installs:
 
 ```bash
-npx skills add tlpinney/remuda --skill remuda -g
+npx skills add tlpinney/herdr-remuda --skill remuda -g
 ```
 
 `-g` installs it for your supported agents globally; leave it out to install it into the current project. `remuda --skill` prints the copy built into your remuda binary.
@@ -172,10 +172,10 @@ CI never has the signing key, so a compromised workflow cannot produce a release
   ```bash
   ssh-keygen -Y verify -f signing/allowed_signers -I tlpinney -n remuda-release -s SHA256SUMS.sig < SHA256SUMS
   shasum -a 256 -c SHA256SUMS --ignore-missing
-  gh attestation verify remuda-macos-aarch64.tar.gz --repo tlpinney/remuda
+  gh attestation verify remuda-macos-aarch64.tar.gz --repo tlpinney/herdr-remuda
   ```
 
-- **Trust root.** The signing key list ships in this repository, so it protects against tampered releases, not against a compromised repository. Pin a reviewed commit with `herdr plugin install tlpinney/remuda --ref <commit>` if that matters to you.
+- **Trust root.** The signing key list ships in this repository, so it protects against tampered releases, not against a compromised repository. Pin a reviewed commit with `herdr plugin install tlpinney/herdr-remuda --ref <commit>` if that matters to you.
 - **What a driven mirror can do.** A driven mirror types into the source pane with your keystrokes, over your own SSH access. Read-only mirrors never send input.
 
 ## License
