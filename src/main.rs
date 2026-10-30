@@ -28,6 +28,8 @@ mod send;
 mod spec;
 mod view;
 mod views;
+#[cfg(unix)]
+mod watch;
 
 use std::process::ExitCode;
 

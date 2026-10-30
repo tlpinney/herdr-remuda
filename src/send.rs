@@ -9,7 +9,10 @@
 //!
 //! `@<herd>@<machine>` sends to every agent in a herd at once.
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -26,6 +29,11 @@ const POLL: Duration = Duration::from_secs(1);
 /// Polls in a row the agent must be ready before it is typed into, so a
 /// moment of idle between two steps of a turn is not taken for the end.
 const READY_POLLS: u32 = 2;
+/// The same rule for a herd, whose states arrive as events: how long an
+/// agent must have been ready.
+const SETTLE: Duration = Duration::from_secs(1);
+/// How often a herd send looks at the states the events keep current.
+const CHECK: Duration = Duration::from_millis(50);
 const DEFAULT_WAIT: u64 = 600;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -133,7 +141,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
             let machine = machine.unwrap_or_default();
             let herd = herds::find(name, machine)
                 .ok_or_else(|| format!("no herd {name}@{machine} here"))?;
-            let listed = herdr::json(&["pane", "list"], Some(machine))?;
+            let listed = api(Some(machine), "pane.list", json!({}), &["pane", "list"])?;
             herds::members(&listed, &herd.workspace)
                 .into_iter()
                 .filter(|member| member.status != "no agent")
@@ -145,17 +153,38 @@ pub fn run(args: &[String]) -> Result<(), String> {
     if recipients.is_empty() {
         return Err(format!("no agents in herd {}", at(&options.agent)));
     }
+    // A herd's states come from one feed for all of its agents; one agent
+    // is asked for its own.
+    let states = options.agent.starts_with('@').then(|| {
+        States::follow(
+            machine,
+            recipients.iter().map(|(_, pane)| pane.clone()).collect(),
+        )
+    });
     let sends: Vec<_> = recipients
         .into_iter()
         .map(|(to, agent)| {
             let (machine, wait, message) = (options.machine.clone(), options.wait, message.clone());
-            let handle = thread::spawn(move || deliver(&agent, machine.as_deref(), wait, &message));
+            let states = states.clone();
+            let handle = thread::spawn(move || match states {
+                Some(states) => {
+                    deliver_settled(&agent, &states, machine.as_deref(), wait, &message)
+                }
+                None => deliver(&agent, machine.as_deref(), wait, &message),
+            });
             (to, handle)
         })
         .collect();
     let mut failed = 0;
-    for (to, handle) in sends {
-        let outcome = handle.join().unwrap_or_else(|_| Err("send crashed".into()));
+    let outcomes: Vec<_> = sends
+        .into_iter()
+        .map(|(to, handle)| (to, handle.join()))
+        .collect();
+    if let Some(states) = &states {
+        states.stop();
+    }
+    for (to, outcome) in outcomes {
+        let outcome = outcome.unwrap_or_else(|_| Err("send crashed".into()));
         log(&from, &to, text, &outcome);
         match outcome {
             Ok(via) => println!("sent to {to} ({via})"),
@@ -212,7 +241,13 @@ fn deliver(
     let mut ready = 0;
     let mut said_waiting = false;
     loop {
-        let agent = match herdr::json(&["agent", "get", target], machine) {
+        let got = api(
+            machine,
+            "agent.get",
+            json!({"target": target}),
+            &["agent", "get", target],
+        );
+        let agent = match got {
             Ok(mut result) => result["agent"].take(),
             Err(err) if err.contains("agent_not_found") => return Err(err),
             // A machine that does not answer this once (a busy connection, a
@@ -243,6 +278,157 @@ fn deliver(
     }
 }
 
+/// Waits until a herd agent has been ready for `SETTLE`, by the states
+/// `states` keeps, then types the message. Returns how it was typed.
+fn deliver_settled(
+    pane: &str,
+    states: &States,
+    machine: Option<&str>,
+    wait: Duration,
+    message: &str,
+) -> Result<&'static str, String> {
+    let deadline = Instant::now() + wait;
+    let mut said_waiting = false;
+    loop {
+        let (status, since) = states.get(pane);
+        if is_ready(&status) && since.elapsed() >= SETTLE {
+            match type_message(pane, pane, machine, message) {
+                // Blocked after all: wait for the next time it is ready.
+                Err(err) if err.contains("agent_blocked") => states.touch(pane),
+                other => return other,
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("{pane} is {status}; gave up waiting"));
+        }
+        if !said_waiting && !is_ready(&status) {
+            eprintln!(
+                "{} remuda: {pane} is {status}; sending once it is idle",
+                herdr::MARK
+            );
+            said_waiting = true;
+        }
+        thread::sleep(CHECK);
+    }
+}
+
+/// A herd's agent states and when each last changed, kept current for a
+/// send by one feed: herdr's events over the machine's forwarded socket, or
+/// one `pane list` a second when there is no socket.
+#[derive(Clone)]
+struct States {
+    states: Arc<Mutex<HashMap<String, (String, Instant)>>>,
+    done: Arc<AtomicBool>,
+}
+
+impl States {
+    fn follow(machine: Option<&str>, panes: Vec<String>) -> States {
+        let states = States {
+            states: Arc::default(),
+            done: Arc::default(),
+        };
+        let (feed, machine) = (states.clone(), machine.map(str::to_string));
+        thread::spawn(move || feed.run(machine.as_deref(), &panes));
+        states
+    }
+
+    fn run(&self, machine: Option<&str>, panes: &[String]) {
+        while !self.done.load(Ordering::Relaxed) {
+            #[cfg(unix)]
+            if let Some(socket) = herdr::api_socket(machine) {
+                self.follow_events(&socket, panes);
+                continue;
+            }
+            if let Ok(listed) = herdr::json(&["pane", "list"], machine) {
+                self.set_listed(&listed);
+            }
+            thread::sleep(POLL);
+        }
+    }
+
+    /// Subscribes, then lists, then applies events until the subscription
+    /// ends or the send is over.
+    #[cfg(unix)]
+    fn follow_events(&self, socket: &std::path::Path, panes: &[String]) {
+        let Ok(mut subscription) = crate::watch::Subscription::start(socket, panes) else {
+            thread::sleep(POLL);
+            return;
+        };
+        match crate::watch::list(socket) {
+            Ok(listed) => self.set_listed(&listed),
+            Err(_) => return,
+        }
+        while !self.done.load(Ordering::Relaxed) {
+            match subscription.next() {
+                Ok(Some(event)) => {
+                    let data = &event["data"];
+                    if let (Some(pane), Some(status)) =
+                        (data["pane_id"].as_str(), data["agent_status"].as_str())
+                    {
+                        self.set(pane, status);
+                    }
+                }
+                Ok(None) => {}
+                Err(_) => return,
+            }
+        }
+    }
+
+    fn set_listed(&self, listed: &Value) {
+        for pane in listed["panes"].as_array().into_iter().flatten() {
+            if let (Some(id), Some(status)) =
+                (pane["pane_id"].as_str(), pane["agent_status"].as_str())
+            {
+                self.set(id, status);
+            }
+        }
+    }
+
+    /// Records `status`, keeping when it began if it has not changed.
+    fn set(&self, pane: &str, status: &str) {
+        let Ok(mut states) = self.states.lock() else {
+            return;
+        };
+        let unchanged = states.get(pane).is_some_and(|(was, _)| was == status);
+        if !unchanged {
+            states.insert(pane.to_string(), (status.to_string(), Instant::now()));
+        }
+    }
+
+    /// Restarts the agent's settle time, after herdr refused it as blocked.
+    fn touch(&self, pane: &str) {
+        if let Ok(mut states) = self.states.lock() {
+            if let Some((_, since)) = states.get_mut(pane) {
+                *since = Instant::now();
+            }
+        }
+    }
+
+    /// The agent's state and since when; `unreachable` until first heard.
+    fn get(&self, pane: &str) -> (String, Instant) {
+        self.states
+            .lock()
+            .ok()
+            .and_then(|states| states.get(pane).cloned())
+            .unwrap_or_else(|| ("unreachable".into(), Instant::now()))
+    }
+
+    fn stop(&self) {
+        self.done.store(true, Ordering::Relaxed);
+    }
+}
+
+/// A herdr call over the machine's API socket when one reaches it without
+/// starting a process, else the same call through the CLI.
+fn api(machine: Option<&str>, method: &str, params: Value, cli: &[&str]) -> Result<Value, String> {
+    #[cfg(unix)]
+    if let Some(socket) = herdr::api_socket(machine) {
+        return herdr::request_at(&socket, method, params);
+    }
+    let _ = (method, params);
+    herdr::json(cli, machine)
+}
+
 /// An agent at its prompt waiting for the next instruction.
 fn is_ready(status: &str) -> bool {
     matches!(status, "idle" | "done")
@@ -254,13 +440,32 @@ fn type_message(
     machine: Option<&str>,
     message: &str,
 ) -> Result<&'static str, String> {
-    match herdr::json(&["agent", "prompt", agent, message], machine) {
+    let prompt = json!({"target": agent, "text": message});
+    match api(
+        machine,
+        "agent.prompt",
+        prompt,
+        &["agent", "prompt", agent, message],
+    ) {
         Ok(_) => Ok("agent prompt"),
         // Herdr only prompts agents it starts itself.
         Err(err) if err.contains("not an active named agent") => {
-            herdr::run_on(machine, &["pane", "send-text", pane, &one_line(message)])?;
+            let line = one_line(message);
+            let text = json!({"pane_id": pane, "text": line});
+            api(
+                machine,
+                "pane.send_text",
+                text,
+                &["pane", "send-text", pane, &line],
+            )?;
             thread::sleep(Duration::from_millis(300));
-            herdr::run_on(machine, &["pane", "send-keys", pane, "enter"])?;
+            let keys = json!({"pane_id": pane, "keys": ["enter"]});
+            api(
+                machine,
+                "pane.send_keys",
+                keys,
+                &["pane", "send-keys", pane, "enter"],
+            )?;
             Ok("typed")
         }
         Err(err) => Err(err),

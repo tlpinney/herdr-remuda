@@ -516,8 +516,55 @@ pub fn run(args: &[String]) -> Result<(), String> {
         None => board(BoardOptions::default()),
         Some("board") => board(BoardOptions::parse(&args[1..])?),
         Some("--seats" | "--beside" | "--grid") => board(BoardOptions::parse(args)?),
+        Some("watch") => trace(&args[1..]),
         Some(flag) if flag.starts_with("--") => one_shot(args),
         Some(command) => herds::command(command, &args[1..]),
+    }
+}
+
+/// `remuda herd watch [--for SECS]`: what the board hears, without the
+/// board. Prints a JSON line each time an agent's status changes, stamped
+/// with when remuda learned of it, so a load test can time how quickly the
+/// board hears about changes and which ones it never hears.
+fn trace(args: &[String]) -> Result<(), String> {
+    let seconds = match args {
+        [] => None,
+        [flag, value] if flag == "--for" => Some(
+            value
+                .parse::<u64>()
+                .map_err(|_| format!("--for needs seconds, not {value}"))?,
+        ),
+        _ => return Err("usage: remuda herd watch [--for SECS]".into()),
+    };
+    let deadline = seconds.map(|secs| Instant::now() + Duration::from_secs(secs));
+    let (events, inbox) = mpsc::channel();
+    spawn_poller(events);
+    let mut last: HashMap<String, String> = HashMap::new();
+    loop {
+        let wait = match deadline {
+            Some(deadline) => match deadline.checked_duration_since(Instant::now()) {
+                Some(left) => left,
+                None => return Ok(()),
+            },
+            None => Duration::from_secs(3600),
+        };
+        let Ok(poll) = inbox.recv_timeout(wait) else {
+            continue;
+        };
+        let at = herds::now_ns();
+        for (herd, machine, seen) in poll.seen {
+            if last.get(&seen.pane) == Some(&seen.status) {
+                continue;
+            }
+            println!(
+                "{}",
+                serde_json::json!({
+                    "t_ns": at, "machine": machine, "herd": herd,
+                    "pane": seen.pane, "name": seen.name, "status": seen.status,
+                })
+            );
+            last.insert(seen.pane, seen.status);
+        }
     }
 }
 
@@ -845,35 +892,93 @@ fn notify(member: &Member) {
     });
 }
 
+/// Follows every watched herd: each machine's listing as `watch` keeps it,
+/// gathered into one poll whenever a machine's changes, and at least once a
+/// second so herds added or forgotten show up.
+#[cfg(unix)]
+fn spawn_poller(events: Sender<Poll>) {
+    let (updates, inbox) = mpsc::channel();
+    crate::watch::spawn(updates);
+    thread::spawn(move || {
+        let mut listings: HashMap<String, Option<Value>> = HashMap::new();
+        loop {
+            match inbox.recv_timeout(POLL) {
+                Ok(listing) => {
+                    listings.insert(listing.machine, listing.listed);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+            // Fold in whatever else arrived meanwhile: one poll for a burst.
+            while let Ok(listing) = inbox.try_recv() {
+                listings.insert(listing.machine, listing.listed);
+            }
+            let poll = gather(&herds::load(), |machine| match listings.get(machine) {
+                Some(Some(listed)) => Some(Ok(listed)),
+                Some(None) => Some(Err(())),
+                // Not heard from yet: watched, but keeping its agents' states.
+                None => None,
+            });
+            if events.send(poll).is_err() {
+                return;
+            }
+        }
+    });
+}
+
 /// Polls every watched herd once a second, one `pane list` per machine.
+#[cfg(not(unix))]
 fn spawn_poller(events: Sender<Poll>) {
     thread::spawn(move || loop {
         let herds = herds::load();
-        let mut poll = Poll {
-            herds: herds.iter().map(herds::Herd::label).collect(),
-            ..Poll::default()
-        };
-        let mut machines: Vec<&str> = herds.iter().map(|h| h.machine.as_str()).collect();
-        machines.sort();
-        machines.dedup();
-        for machine in machines {
-            poll.watched.insert(machine.to_string());
-            let Ok(listed) = herdr::json(&["pane", "list"], Some(machine)) else {
-                poll.errors.push(format!("{machine} not answering"));
-                continue;
-            };
-            poll.answered.insert(machine.to_string());
-            for herd in herds.iter().filter(|h| h.machine == machine) {
-                for seen in herds::members(&listed, &herd.workspace) {
-                    poll.seen.push((herd.label(), machine.to_string(), seen));
-                }
-            }
+        let mut listings = HashMap::new();
+        for herd in &herds {
+            listings
+                .entry(herd.machine.clone())
+                .or_insert_with(|| herdr::json(&["pane", "list"], Some(&herd.machine)).ok());
         }
+        let poll = gather(&herds, |machine| match listings.get(machine) {
+            Some(Some(listed)) => Some(Ok(listed)),
+            _ => Some(Err(())),
+        });
         if events.send(poll).is_err() {
             return;
         }
         thread::sleep(POLL);
     });
+}
+
+/// One poll of `herds` from each machine's listing: `Ok` when it answered,
+/// `Err` when it did not, `None` when it has not been heard from yet.
+fn gather<'a>(
+    herds: &[herds::Herd],
+    listing: impl Fn(&str) -> Option<Result<&'a Value, ()>>,
+) -> Poll {
+    let mut poll = Poll {
+        herds: herds.iter().map(herds::Herd::label).collect(),
+        ..Poll::default()
+    };
+    let mut machines: Vec<&str> = herds.iter().map(|h| h.machine.as_str()).collect();
+    machines.sort();
+    machines.dedup();
+    for machine in machines {
+        poll.watched.insert(machine.to_string());
+        let listed = match listing(machine) {
+            Some(Ok(listed)) => listed,
+            Some(Err(())) => {
+                poll.errors.push(format!("{machine} not answering"));
+                continue;
+            }
+            None => continue,
+        };
+        poll.answered.insert(machine.to_string());
+        for herd in herds.iter().filter(|h| h.machine == machine) {
+            for seen in herds::members(listed, &herd.workspace) {
+                poll.seen.push((herd.label(), machine.to_string(), seen));
+            }
+        }
+    }
+    poll
 }
 
 fn draw(frame: &mut Frame, state: &Board, poll: &Poll, polled: bool) {

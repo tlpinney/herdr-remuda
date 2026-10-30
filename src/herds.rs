@@ -166,6 +166,14 @@ pub fn now_secs() -> u64 {
         .unwrap_or_default()
 }
 
+/// Now, in nanoseconds since the Unix epoch.
+pub fn now_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or_default()
+}
+
 /// Sets (or, with `None`, clears) herd tokens on a remote pane.
 pub fn tag(machine: &str, pane: &str, tokens: &[(&str, Option<&str>)]) -> Result<(), String> {
     let mut args = vec![

@@ -98,12 +98,31 @@ pub fn json(args: &[&str], machine: Option<&str>) -> Result<Value, String> {
 /// (`layout.export`, `layout.apply`).
 #[cfg(unix)]
 pub fn socket_request(method: &str, params: Value) -> Result<Value, String> {
-    use std::io::{BufRead, BufReader, Write};
-
     let path = std::env::var("HERDR_SOCKET_PATH")
         .map_err(|_| "HERDR_SOCKET_PATH is not set; run this inside herdr".to_string())?;
-    let mut stream = std::os::unix::net::UnixStream::connect(&path)
-        .map_err(|err| format!("connect to herdr at {path}: {err}"))?;
+    request_at(std::path::Path::new(&path), method, params)
+}
+
+/// The API socket that reaches herdr on `machine` without starting a
+/// process: this herdr's own, or a saved machine's forwarded one. `None`
+/// when there is none, and callers use the CLI instead.
+pub fn api_socket(machine: Option<&str>) -> Option<std::path::PathBuf> {
+    match machine {
+        None => std::env::var_os("HERDR_SOCKET_PATH").map(Into::into),
+        Some(label) => Remote::new(&cached_machine(label)?).forwarded_socket(),
+    }
+}
+
+/// One request on herdr's API socket at `path`. Herdr answers one request
+/// per connection, so each call connects afresh; on a forwarded socket that
+/// is a new channel on the machine's open SSH connection, with no `herdr`
+/// started on either end. Errors carry herdr's code, as the CLI's do.
+#[cfg(unix)]
+pub fn request_at(path: &std::path::Path, method: &str, params: Value) -> Result<Value, String> {
+    use std::io::{BufRead, BufReader, Write};
+
+    let mut stream = std::os::unix::net::UnixStream::connect(path)
+        .map_err(|err| format!("connect to herdr at {}: {err}", path.display()))?;
     let request = serde_json::json!({"id": "remuda", "method": method, "params": params});
     writeln!(stream, "{request}").map_err(|err| format!("{method}: {err}"))?;
     let mut line = String::new();
@@ -113,8 +132,9 @@ pub fn socket_request(method: &str, params: Value) -> Result<Value, String> {
     let mut response: Value =
         serde_json::from_str(&line).map_err(|err| format!("{method}: invalid response: {err}"))?;
     if let Some(error) = response.get("error") {
+        let code = error["code"].as_str().unwrap_or("error");
         let message = error["message"].as_str().unwrap_or("unknown error");
-        return Err(format!("{method}: {message}"));
+        return Err(format!("{method}: {code}: {message}"));
     }
     Ok(response["result"].take())
 }
