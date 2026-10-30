@@ -135,11 +135,11 @@ smooth_scroll = true
 
 ## How it works
 
-A mirror shows its source through a read-only `terminal session observe` stream sized to the mirror, so watching never resizes anything. A driven mirror adds a `terminal session control` stream for input, and the size it requests is set by the resize policy. Remote streams run the remote `herdr` over SSH.
+A mirror shows its source through a read-only `terminal session observe` stream sized to the mirror, so watching never resizes anything. A driven mirror adds a `terminal session control` stream for input, and the size it requests is set by the resize policy. Remote streams run the local `herdr` against the machine's forwarded sockets (below).
 
 Each mirror reports itself to Herdr as an agent, with the source's state and a resume command, so the sidebar shows it and Herdr reopens it after a restart. Its settings travel as `remuda_*` pane metadata tokens, which saved views read back. It marks the source pane through `herdr --machine` with a TTL that it refreshes while it runs, so a mirror that dies leaves no lasting mark.
 
-All remote calls to a machine share one SSH control connection, started once with your SSH config; later calls attach to it without rereading the config, which keeps a slow `Match exec` from costing seconds per call. When it cannot start, calls fall back to `herdr --machine` and plain `ssh`.
+All remote calls to a machine share one SSH control connection, started once with your SSH config; later calls attach to it without rereading the config, which keeps a slow `Match exec` from costing seconds per call. That connection forwards the machine's Herdr API and client sockets to local sockets in `/tmp/remuda-<uid>/`, and remote calls and streams run the local `herdr` against them. Each is a forwarded channel, not an SSH session, so sshd's `MaxSessions` (10 by default) does not cap how many mirrors a machine can stream, and no shell or `herdr` starts on the machine per call. If the sockets cannot be forwarded (for example `AllowStreamLocalForwarding no`), calls run the remote `herdr` over the shared connection instead, and when that cannot start, they fall back to `herdr --machine` and plain `ssh`.
 
 When a stream drops, the mirror keeps its last frame under a "reconnecting" bar and retries with backoff. When the machine answers but the source pane is gone, it says so and closes itself after a minute unless the pane comes back. At startup (a restart or a saved view) it finds a source that moved to a new pane id by its label, agent, title and directory; a reconnect only looks for the same pane.
 
