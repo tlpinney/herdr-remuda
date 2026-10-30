@@ -128,6 +128,9 @@ npx skills add tlpinney/remuda --skill remuda -g
 name = "my-laptop"
 # The herd board's seat grid, ROWSxCOLS (default: what fits the screen).
 grid = "2x4"
+# Experimental: scroll one row per wheel event while the source declares
+# smooth scroll regions, which only a herdr fork sends (default: false).
+smooth_scroll = true
 ```
 
 ## How it works

@@ -5,6 +5,9 @@
 //! name = "my-laptop"
 //! # The herd board's seat grid, ROWSxCOLS (default: what fits the screen).
 //! grid = "2x4"
+//! # Experimental: scroll one row per wheel event while the source declares
+//! # smooth scroll regions, which only a herdr fork sends (default: false).
+//! smooth_scroll = true
 //! ```
 
 use std::path::PathBuf;
@@ -20,6 +23,8 @@ pub struct Config {
     pub name: Option<String>,
     #[serde(default)]
     pub grid: Option<String>,
+    #[serde(default)]
+    pub smooth_scroll: bool,
 }
 
 impl Config {
@@ -96,6 +101,16 @@ mod tests {
         assert_eq!(named.machine_name(), "my-laptop");
         let blank: Config = toml::from_str(r#"name = "  ""#).unwrap();
         assert!(!blank.machine_name().is_empty());
+    }
+
+    #[test]
+    fn smooth_scroll_is_off_unless_set() {
+        assert!(!toml::from_str::<Config>("").unwrap().smooth_scroll);
+        assert!(
+            toml::from_str::<Config>("smooth_scroll = true")
+                .unwrap()
+                .smooth_scroll
+        );
     }
 
     #[test]

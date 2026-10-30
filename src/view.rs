@@ -451,6 +451,9 @@ struct Mirror {
     /// cleared (bit per slot). While any is active the host terminal sends
     /// one wheel event per row, so the source scrolls one row per event.
     smooth_slots: u8,
+    /// The experimental `smooth_scroll` setting. Off, the wheel always moves
+    /// `WHEEL_LINES`, whatever regions the source declares.
+    smooth_scroll: bool,
 }
 
 impl Mirror {
@@ -501,6 +504,7 @@ impl Mirror {
             presence: Some(presence),
             presence_mark: None,
             smooth_slots: 0,
+            smooth_scroll: config.smooth_scroll,
         };
         mirror.report(Some(source));
         Ok(mirror)
@@ -573,7 +577,9 @@ impl Mirror {
                 // A window drag sends a burst of these; act once it settles.
                 Ok(Event::Resized) => resize_due = Some(Instant::now() + RESIZE_SETTLE),
                 Ok(Event::Frame { generation, bytes }) if generation == self.generation => {
-                    track_smooth_slots(&mut self.smooth_slots, &bytes);
+                    if self.smooth_scroll {
+                        track_smooth_slots(&mut self.smooth_slots, &bytes);
+                    }
                     write_out(&bytes);
                     self.draw_status();
                 }
