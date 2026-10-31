@@ -84,10 +84,11 @@ It waits up to 10 minutes (`--wait SECONDS`) and logs every message to `messages
 
 ## When mirrors or seats look view-only or keep reconnecting
 
-A driven mirror's (or seat's) bottom bar should read `control · <size>`. If it reads `reconnecting · input lost: ssh: connect to host …`, the machine's sshd refused a session: all remuda calls share one SSH connection per machine and sshd allows 10 sessions per connection (`MaxSessions`); each driven mirror holds 2, a view-only one 1. List the sessions on remuda's connection:
+A driven mirror's (or seat's) bottom bar should read `control · <size>`. If it reads `reconnecting · input lost: ssh: connect to host …`, the machine's sshd refused a session. All remuda calls share one SSH connection per machine, which forwards the machine's herdr sockets to `/tmp/remuda-<uid>/`; mirrors stream over those as forwarded channels, which sshd does not count as sessions. Only a machine that refuses socket forwarding (`AllowStreamLocalForwarding no`) makes remuda fall back to SSH sessions, and sshd allows 10 per connection (`MaxSessions`): each driven mirror holds 2, a view-only one 1. Check for the forwarded sockets and list remuda's connections:
 
 ```bash
+ls /tmp/remuda-$(id -u)/*.sock
 pgrep -fl "ControlPath=/tmp/remuda-$(id -u)/"
 ```
 
-Fewer mirrors (for a herd, `--seats 2`), or a higher `MaxSessions` in the remote's `sshd_config` (the user's call; it needs root there), fixes it.
+Allowing stream forwarding in the remote's `sshd_config`, a higher `MaxSessions` there (either is the user's call; both need root there), or fewer mirrors (for a herd, `--seats 2`) fixes it.

@@ -1,9 +1,9 @@
 //! Marks the source pane as mirrored, so the machine it runs on can see who is
 //! watching or driving it.
 //!
-//! The mark is pane metadata on the source, written through `herdr --machine`
-//! like everything else remuda does remotely, so nothing runs on the source
-//! machine. While the source runs an agent, its sidebar name becomes e.g.
+//! The mark is pane metadata on the source, written over the machine's
+//! forwarded herdr socket like everything else remuda does remotely, so
+//! nothing runs on the source machine. While the source runs an agent, its sidebar name becomes e.g.
 //! `claude ⇄ my-laptop (control)`; every source also gets `remuda_watcher`
 //! and `remuda_watch_mode` tokens for custom sidebar rows. The mark carries a
 //! TTL and is refreshed while the mirror lives, so a mirror that dies without
