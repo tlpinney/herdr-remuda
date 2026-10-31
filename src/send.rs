@@ -142,7 +142,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
             let herd = herds::find(name, machine)
                 .ok_or_else(|| format!("no herd {name}@{machine} here"))?;
             let listed = api(Some(machine), "pane.list", json!({}), &["pane", "list"])?;
-            herds::members(&listed, &herd.workspace)
+            herds::herd_members(&listed, &herd)
                 .into_iter()
                 .filter(|member| member.status != "no agent")
                 .map(|member| (at(&member.name), member.pane))

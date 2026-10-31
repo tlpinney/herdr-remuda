@@ -973,7 +973,7 @@ fn gather<'a>(
         };
         poll.answered.insert(machine.to_string());
         for herd in herds.iter().filter(|h| h.machine == machine) {
-            for seen in herds::members(listed, &herd.workspace) {
+            for seen in herds::herd_members(listed, herd) {
                 poll.seen.push((herd.label(), machine.to_string(), seen));
             }
         }

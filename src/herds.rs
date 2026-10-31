@@ -110,6 +110,48 @@ pub struct Seen {
     pub title: String,
 }
 
+/// The members of `herd` in a machine's `pane list`. Herdr reuses the id of
+/// a closed workspace, so a herd counts its workspace as its own only while
+/// some pane there carries its tag; panes another herd tagged are left out,
+/// and untagged agents count, as ones added to the herd by hand.
+pub fn herd_members(listed: &Value, herd: &Herd) -> Vec<Seen> {
+    if !owns(listed, herd) {
+        return Vec::new();
+    }
+    let others: HashSet<&str> = panes_in(listed, &herd.workspace)
+        .filter(|pane| {
+            pane["tokens"][TOKEN_HERD]
+                .as_str()
+                .is_some_and(|tag| tag != herd.name)
+        })
+        .filter_map(|pane| pane["pane_id"].as_str())
+        .collect();
+    members(listed, &herd.workspace)
+        .into_iter()
+        .filter(|member| !others.contains(member.pane.as_str()))
+        .collect()
+}
+
+/// Whether `herd`'s workspace still holds a pane remuda tagged for it, rather
+/// than being gone or another workspace that got its id.
+fn owns(listed: &Value, herd: &Herd) -> bool {
+    panes_in(listed, &herd.workspace)
+        .any(|pane| pane["tokens"][TOKEN_HERD].as_str() == Some(herd.name.as_str()))
+}
+
+/// Whether a machine's `pane list` has any pane in `workspace`.
+fn has_panes(listed: &Value, workspace: &str) -> bool {
+    panes_in(listed, workspace).next().is_some()
+}
+
+fn panes_in<'a>(listed: &'a Value, workspace: &'a str) -> impl Iterator<Item = &'a Value> {
+    listed["panes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(move |pane| pane["workspace_id"] == workspace)
+}
+
 /// The members of `workspace` in a machine's `pane list`: agent panes, and
 /// panes remuda tagged that have no agent yet.
 pub fn members(listed: &Value, workspace: &str) -> Vec<Seen> {
@@ -344,11 +386,7 @@ fn add_agents(herd: &Herd, start: &Start, first: Option<(String, String)>) -> Re
         .filter_map(|agent| agent["name"].as_str().map(str::to_string))
         .collect();
     // Agents run in the shell are named only once they report.
-    taken.extend(
-        members(&listed, &herd.workspace)
-            .into_iter()
-            .map(|m| m.name),
-    );
+    taken.extend(herd_members(&listed, herd).into_iter().map(|m| m.name));
     let taken: HashSet<&str> = taken.iter().map(String::as_str).collect();
     let names = pick_names(&herd.name, start.count, &taken);
 
@@ -476,6 +514,16 @@ pub fn command(command: &str, args: &[String]) -> Result<(), String> {
         }
         ("add", [target, rest @ ..]) => {
             let herd = find_ref(target)?;
+            let listed = herdr::json(&["pane", "list"], Some(&herd.machine))?;
+            if has_panes(&listed, &herd.workspace) && !owns(&listed, &herd) {
+                return Err(format!(
+                    "workspace {} on {} is no longer {}'s (herdr reused its id); `remuda herd forget {}`",
+                    herd.workspace,
+                    herd.machine,
+                    herd.label(),
+                    herd.label()
+                ));
+            }
             let start = on_machine(&Start::parse(rest, 1)?, &herd.machine)?;
             add_agents(&herd, &start, None)
         }
@@ -494,6 +542,19 @@ pub fn command(command: &str, args: &[String]) -> Result<(), String> {
         }
         ("stop", [target]) => {
             let herd = find_ref(target)?;
+            // The workspace may be gone and its id given to another one:
+            // close it only while it is still this herd's.
+            let listed = herdr::json(&["pane", "list"], Some(&herd.machine))?;
+            if has_panes(&listed, &herd.workspace) && !owns(&listed, &herd) {
+                unregister(&herd)?;
+                println!(
+                    "{} forgot {}: workspace {} now holds other panes, so it stays open",
+                    herdr::MARK,
+                    herd.label(),
+                    herd.workspace
+                );
+                return Ok(());
+            }
             // Closing the workspace ends every agent in it.
             if let Err(err) = herdr::run_on(
                 Some(&herd.machine),
@@ -536,7 +597,7 @@ fn unregister(herd: &Herd) -> Result<(), String> {
 fn remove(herd: &Herd, agent: &str) -> Result<(), String> {
     let machine = herd.machine.as_str();
     let listed = herdr::json(&["pane", "list"], Some(machine))?;
-    let member = members(&listed, &herd.workspace)
+    let member = herd_members(&listed, herd)
         .into_iter()
         .find(|m| m.name == agent || m.pane == agent)
         .ok_or_else(|| format!("no agent {agent} in herd {}", herd.label()))?;
@@ -621,7 +682,7 @@ fn list() -> Result<(), String> {
     for herd in herds {
         match herdr::json(&["pane", "list"], Some(&herd.machine)) {
             Ok(listed) => {
-                let found = members(&listed, &herd.workspace);
+                let found = herd_members(&listed, &herd);
                 println!(
                     "{}\t{}\t{}",
                     herd.label(),
@@ -755,5 +816,43 @@ mod tests {
         assert_eq!(start.agent_args, ["--model", "x"]);
         assert_eq!(Start::parse(&[], 3).unwrap().count, 3);
         assert!(Start::parse(&args(&["--count", "0"]), 1).is_err());
+    }
+
+    fn reused() -> Value {
+        json!({"panes": [
+            {"pane_id": "wW:p1", "workspace_id": "wW", "agent": "claude", "agent_status": "idle",
+             "tokens": {"remuda_herd": "ht", "remuda_name": "ht-1"}},
+            {"pane_id": "wW:p2", "workspace_id": "wW", "agent": "claude", "agent_status": "working",
+             "tokens": {}},
+        ]})
+    }
+
+    fn herd(name: &str) -> Herd {
+        Herd {
+            name: name.into(),
+            machine: "devbox".into(),
+            workspace: "wW".into(),
+        }
+    }
+
+    #[test]
+    fn a_herd_ignores_a_workspace_that_reused_its_id() {
+        assert!(herd_members(&reused(), &herd("aug")).is_empty());
+        assert!(!owns(&reused(), &herd("aug")));
+        assert!(has_panes(&reused(), "wW"));
+    }
+
+    #[test]
+    fn a_herd_keeps_its_tagged_and_hand_added_agents() {
+        let found = herd_members(&reused(), &herd("ht"));
+        let names: Vec<&str> = found.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, ["ht-1", "claude wW:p2"]);
+    }
+
+    #[test]
+    fn panes_another_herd_tagged_are_not_members() {
+        let mut listed = reused();
+        listed["panes"][1]["tokens"] = json!({"remuda_herd": "other"});
+        assert_eq!(herd_members(&listed, &herd("ht")).len(), 1);
     }
 }
