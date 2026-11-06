@@ -180,4 +180,4 @@ CI never has the signing key, so a compromised workflow cannot produce a release
 
 ## License
 
-Apache-2.0, the same license as Herdr. See [LICENSE](LICENSE).
+Apache-2.0. See [LICENSE](LICENSE).
