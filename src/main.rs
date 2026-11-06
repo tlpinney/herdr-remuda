@@ -19,6 +19,7 @@ mod herdr;
 mod herds;
 mod input;
 mod install;
+mod paste;
 mod pick;
 mod presence;
 mod remote;

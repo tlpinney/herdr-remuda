@@ -20,6 +20,7 @@ use crate::config::Config;
 use crate::geometry::{Policy, Size, SourceGeometry};
 use crate::herdr::{self, Machine, StreamKind, MARK};
 use crate::input;
+use crate::paste;
 use crate::presence::{self, Presence};
 use crate::report::{self, Report, Reporter};
 use crate::spec::{self, Hints, MirrorSpec, Mode};
@@ -61,6 +62,10 @@ enum Event {
         source: String,
     },
     SourceLookupFailed(LookupFailure),
+    /// A Ctrl+V in a remote control mirror settled: the image's path on the
+    /// source's machine, `None` when the clipboard held no image, or why the
+    /// image could not be sent.
+    ImagePasted(Result<Option<String>, String>),
 }
 
 /// How a mirror's connection ended.
@@ -152,6 +157,7 @@ impl Drop for Screen {
     fn drop(&mut self) {
         write_out(input::MOUSE_OFF);
         write_out(input::MODIFIED_KEYS_OFF);
+        write_out(input::PASTE_OFF);
         write_out(b"\x1b[?1049l");
         let _ = crossterm::terminal::disable_raw_mode();
     }
@@ -454,6 +460,9 @@ struct Mirror {
     /// The experimental `smooth_scroll` setting. Off, the wheel always moves
     /// `WHEEL_LINES`, whatever regions the source declares.
     smooth_scroll: bool,
+    /// While a clipboard image is on its way to the source's machine: keys
+    /// typed since, sent after its path, and the note to restore.
+    image_paste: Option<(Vec<u8>, String)>,
 }
 
 impl Mirror {
@@ -505,6 +514,7 @@ impl Mirror {
             presence_mark: None,
             smooth_slots: 0,
             smooth_scroll: config.smooth_scroll,
+            image_paste: None,
         };
         mirror.report(Some(source));
         Ok(mirror)
@@ -519,9 +529,11 @@ impl Mirror {
             }
             // Ask for real mouse events (otherwise herdr turns the wheel into
             // arrow keys, which an agent's prompt reads as input history) and
-            // for distinct modified keys, so Shift+Enter survives the trip.
+            // for distinct modified keys, so Shift+Enter survives the trip, and for
+            // bracketed paste, so a multi-line paste arrives in one piece.
             write_out(input::MOUSE_ON);
             write_out(input::MODIFIED_KEYS_ON);
+            write_out(input::PASTE_ON);
         }
         // Only `source` and `smallest` follow the source's own layout; the
         // others need no poll (each one is a session on a remote's connection).
@@ -559,7 +571,7 @@ impl Mirror {
                     if self.control.is_some() {
                         for piece in parser.feed(&bytes) {
                             match piece {
-                                input::Piece::Keys(keys) => self.send_keys(&keys),
+                                input::Piece::Keys(keys) => self.type_keys(&keys),
                                 input::Piece::Mouse(mouse) => self.send_mouse(mouse),
                             }
                         }
@@ -568,7 +580,7 @@ impl Mirror {
                 Err(RecvTimeoutError::Timeout) if parser.holding() => {
                     // Input paused mid-sequence: it was a key (Escape), not a mouse event.
                     if let Some(keys) = parser.flush() {
-                        self.send_keys(&keys);
+                        self.type_keys(&keys);
                     }
                 }
                 Ok(Event::InputClosed) | Err(RecvTimeoutError::Disconnected) => {
@@ -597,10 +609,12 @@ impl Mirror {
                     self.control_size = None;
                     write_out(input::MOUSE_OFF);
                     write_out(input::MODIFIED_KEYS_OFF);
+                    write_out(input::PASTE_OFF);
                     self.note = "another client has control · view-only".into();
                     self.draw_status();
                 }
                 Ok(Event::ControlEnded(note)) => return Ok(Exit::Lost(note)),
+                Ok(Event::ImagePasted(result)) => self.finish_image_paste(result),
                 Ok(Event::SourceFound { .. } | Event::SourceLookupFailed(_)) => {}
                 Ok(Event::NaturalSize(size)) => {
                     self.natural = size;
@@ -630,6 +644,7 @@ impl Mirror {
         if self.control.is_some() {
             write_out(input::MOUSE_OFF);
             write_out(input::MODIFIED_KEYS_OFF);
+            write_out(input::PASTE_OFF);
         }
         self.send_control(json!({"type": "terminal.release"}));
         if let Some(mut child) = self.observe.take() {
@@ -709,7 +724,74 @@ impl Mirror {
         draw_bar(&self.status_line());
     }
 
+    /// Sends typed keys to the source. In a mirror of another machine, Ctrl+V
+    /// first sends this machine's clipboard image there (see `paste`), and
+    /// keys typed meanwhile wait for its path.
+    fn type_keys(&mut self, keys: &[u8]) {
+        if let Some((waiting, _)) = &mut self.image_paste {
+            waiting.extend_from_slice(keys);
+            return;
+        }
+        if self.machine.is_none() {
+            self.send_keys(keys);
+            return;
+        }
+        let mut runs = paste::split(keys).into_iter();
+        while let Some((run, ctrl_v)) = runs.next() {
+            self.send_keys(run);
+            if ctrl_v {
+                self.start_image_paste();
+                // The rest waits for the image.
+                let mut rest = Vec::new();
+                for (run, ctrl_v) in runs.by_ref() {
+                    rest.extend_from_slice(run);
+                    if ctrl_v {
+                        rest.push(paste::KEY);
+                    }
+                }
+                if let Some((waiting, _)) = &mut self.image_paste {
+                    *waiting = rest;
+                }
+            }
+        }
+    }
+
+    fn start_image_paste(&mut self) {
+        let Some(machine) = self.machine.clone() else {
+            return;
+        };
+        let note = std::mem::replace(&mut self.note, "pasting image…".into());
+        self.image_paste = Some((Vec::new(), note));
+        self.draw_status();
+        let events = self.events.clone();
+        thread::spawn(move || {
+            let result = match paste::clipboard_png() {
+                Some(png) => paste::upload(&machine, &png).map(Some),
+                None => Ok(None),
+            };
+            let _ = events.send(Event::ImagePasted(result));
+        });
+    }
+
+    fn finish_image_paste(&mut self, result: Result<Option<String>, String>) {
+        // From an earlier connection's mirror: nothing waits for it.
+        let Some((waiting, note)) = self.image_paste.take() else {
+            return;
+        };
+        self.note = note;
+        match result {
+            Ok(Some(path)) => self.send_keys(&paste::as_paste(&path)),
+            Ok(None) => self.send_keys(&[paste::KEY]),
+            Err(err) => self.note = err,
+        }
+        self.draw_status();
+        self.type_keys(&waiting);
+    }
+
     fn send_keys(&mut self, keys: &[u8]) {
+        if keys.is_empty() {
+            return;
+        }
         let data = base64::engine::general_purpose::STANDARD.encode(keys);
         self.send_control(json!({"type": "terminal.input", "bytes": data}));
     }

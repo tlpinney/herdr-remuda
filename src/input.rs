@@ -26,6 +26,10 @@ pub const MOUSE_OFF: &[u8] = b"\x1b[?1006l\x1b[?1002l\x1b[?1000l";
 /// modifyOtherKeys level 2 on and off.
 pub const MODIFIED_KEYS_ON: &[u8] = b"\x1b[>4;2m";
 pub const MODIFIED_KEYS_OFF: &[u8] = b"\x1b[>4;0m";
+/// Bracketed paste on and off, so a paste reaches the source wrapped in
+/// `ESC [ 200 ~` … `ESC [ 201 ~` and its newlines do not submit line by line.
+pub const PASTE_ON: &[u8] = b"\x1b[?2004h";
+pub const PASTE_OFF: &[u8] = b"\x1b[?2004l";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Button {
