@@ -23,6 +23,7 @@ use crate::input;
 use crate::paste;
 use crate::presence::{self, Presence};
 use crate::report::{self, Report, Reporter};
+use crate::select::{self, Selection, Snapshot};
 use crate::spec::{self, Hints, MirrorSpec, Mode};
 
 const DETACH: u8 = 0x1d; // ctrl+]
@@ -34,6 +35,8 @@ const IDLE_TICK: Duration = Duration::from_millis(200);
 const INPUT_PAUSE: Duration = Duration::from_millis(25);
 /// Lines per wheel step, herdr's default `mouse_scroll_lines`.
 const WHEEL_LINES: u16 = 3;
+/// How long the status bar says a selection was copied.
+const COPIED_NOTE: Duration = Duration::from_secs(2);
 
 /// Stream generations are unique for the whole process, so a frame from a
 /// stream that belonged to an earlier connection is never drawn.
@@ -463,6 +466,23 @@ struct Mirror {
     /// While a clipboard image is on its way to the source's machine: keys
     /// typed since, sent after its path, and the note to restore.
     image_paste: Option<(Vec<u8>, String)>,
+    /// A plain left press, held until it turns out to be a click (sent to
+    /// the source) or the start of a drag selection.
+    press: Option<input::Mouse>,
+    /// The drag selection in progress (see `select`).
+    selecting: Option<Selecting>,
+    /// When a selection was last copied, while the status bar says so.
+    copied: Option<(usize, Instant)>,
+}
+
+struct Selecting {
+    selection: Selection,
+    /// What the pane showed when the drag began, to paint over and restore.
+    snapshot: Snapshot,
+    /// The rows painted last.
+    painted: std::ops::RangeInclusive<u16>,
+    /// Whether the source drew since the drag began, so the snapshot is stale.
+    stale: bool,
 }
 
 impl Mirror {
@@ -515,6 +535,9 @@ impl Mirror {
             smooth_slots: 0,
             smooth_scroll: config.smooth_scroll,
             image_paste: None,
+            press: None,
+            selecting: None,
+            copied: None,
         };
         mirror.report(Some(source));
         Ok(mirror)
@@ -593,6 +616,10 @@ impl Mirror {
                         track_smooth_slots(&mut self.smooth_slots, &bytes);
                     }
                     write_out(&bytes);
+                    if let Some(selecting) = &mut self.selecting {
+                        selecting.stale = true;
+                    }
+                    self.paint_selection(None);
                     self.draw_status();
                 }
                 Ok(Event::ObserveEnded { generation, note }) if generation == self.generation => {
@@ -630,6 +657,13 @@ impl Mirror {
                     self.draw_status();
                 }
                 Err(RecvTimeoutError::Timeout) => {}
+            }
+            if self
+                .copied
+                .is_some_and(|(_, at)| at.elapsed() >= COPIED_NOTE)
+            {
+                self.copied = None;
+                self.draw_status();
             }
             if resize_due.is_some_and(|due| Instant::now() >= due) {
                 resize_due = None;
@@ -713,7 +747,10 @@ impl Mirror {
                 }
             }
         }
-        if !self.note.is_empty() {
+        if let Some((chars, _)) = self.copied {
+            let plural = if chars == 1 { "" } else { "s" };
+            line.push_str(&format!(" · copied {chars} character{plural}"));
+        } else if !self.note.is_empty() {
             line.push_str(&format!(" · {}", self.note));
         }
         line.push_str(" · ctrl+] quit ");
@@ -796,10 +833,168 @@ impl Mirror {
         self.send_control(json!({"type": "terminal.input", "bytes": data}));
     }
 
+    /// Routes a mouse event: a plain left drag selects and copies in the
+    /// mirror (see `select`), a plain left click goes to the source once it
+    /// is released without moving, and everything else goes straight on.
+    fn send_mouse(&mut self, mouse: input::Mouse) {
+        use input::{Button, MouseAction};
+        match mouse.action {
+            MouseAction::Down(Button::Left) if mouse.modifiers == 0 => {
+                self.cancel_selection();
+                self.press = self.on_source(&mouse).then_some(mouse);
+            }
+            MouseAction::Drag(Button::Left) if self.selecting.is_some() => self.drag_to(&mouse),
+            MouseAction::Drag(Button::Left) if self.press.is_some() => {
+                let moved = self
+                    .press
+                    .is_some_and(|press| (press.row, press.column) != self.clamp(&mouse));
+                if moved {
+                    self.start_selection();
+                    self.drag_to(&mouse);
+                }
+            }
+            MouseAction::Up(Button::Left) if self.selecting.is_some() => self.finish_selection(),
+            MouseAction::Up(Button::Left) if self.press.is_some() => {
+                if let Some(press) = self.press.take() {
+                    self.forward_mouse(press);
+                }
+                self.forward_mouse(mouse);
+            }
+            _ => self.forward_mouse(mouse),
+        }
+    }
+
+    /// Whether `mouse` lands on the source's cells, not the status bar or
+    /// space past the source's edge.
+    fn on_source(&self, mouse: &input::Mouse) -> bool {
+        self.control_size.is_some_and(|size| {
+            mouse.row < self.mirror_size().rows && mouse.column < size.cols && mouse.row < size.rows
+        })
+    }
+
+    /// The mirror's cells that show the source, as (cols, rows).
+    fn source_cells(&self) -> (u16, u16) {
+        let mirror = self.mirror_size();
+        let size = self.control_size.unwrap_or(mirror);
+        (
+            mirror.cols.min(size.cols).max(1),
+            mirror.rows.min(size.rows).max(1),
+        )
+    }
+
+    /// `mouse`'s cell, pulled onto the source's cells: a drag may run past them.
+    fn clamp(&self, mouse: &input::Mouse) -> select::Cell {
+        let (cols, rows) = self.source_cells();
+        (mouse.row.min(rows - 1), mouse.column.min(cols - 1))
+    }
+
+    fn start_selection(&mut self) {
+        let Some(press) = self.press.take() else {
+            return;
+        };
+        let Ok(pane_id) = std::env::var("HERDR_PANE_ID") else {
+            return;
+        };
+        match Snapshot::read(&pane_id) {
+            Ok(snapshot) => {
+                let anchor = self.clamp(&press);
+                self.selecting = Some(Selecting {
+                    selection: Selection {
+                        anchor,
+                        cursor: anchor,
+                    },
+                    snapshot,
+                    painted: anchor.0..=anchor.0,
+                    stale: false,
+                });
+            }
+            Err(err) => {
+                self.note = format!("could not select: {err}");
+                self.draw_status();
+            }
+        }
+    }
+
+    fn drag_to(&mut self, mouse: &input::Mouse) {
+        let cell = self.clamp(mouse);
+        let Some(selecting) = &mut self.selecting else {
+            return;
+        };
+        if selecting.selection.cursor == cell {
+            return;
+        }
+        selecting.selection.cursor = cell;
+        let previous = selecting.painted.clone();
+        self.paint_selection(Some(previous));
+    }
+
+    /// Paints the selection, first restoring `previous` rows it no longer
+    /// covers. Synchronized, so a drag does not flicker.
+    fn paint_selection(&mut self, previous: Option<std::ops::RangeInclusive<u16>>) {
+        let (cols, _) = self.source_cells();
+        let Some(selecting) = &mut self.selecting else {
+            return;
+        };
+        let rows = selecting.selection.rows();
+        let mut out = b"\x1b[?2026h\x1b7".to_vec();
+        if let Some(previous) = previous {
+            out.extend(
+                selecting
+                    .snapshot
+                    .restore(previous.filter(|row| !rows.contains(row))),
+            );
+            // Rows still covered may cover less: put them back before painting.
+            out.extend(selecting.snapshot.restore(rows.clone()));
+        }
+        out.extend(selecting.snapshot.paint(&selecting.selection, cols));
+        out.extend_from_slice(b"\x1b8\x1b[?2026l");
+        selecting.painted = rows;
+        write_out(&out);
+    }
+
+    /// Copies the selection to this machine's clipboard and clears it.
+    fn finish_selection(&mut self) {
+        let Some(selecting) = self.selecting.take() else {
+            return;
+        };
+        let text = std::env::var("HERDR_PANE_ID")
+            .map_err(|_| "HERDR_PANE_ID is not set".to_string())
+            .and_then(|pane_id| select::read_text(&pane_id, &selecting.selection));
+        self.clear_selection(selecting);
+        match text {
+            Ok(text) if !text.is_empty() => {
+                write_out(&select::osc52(&text));
+                self.copied = Some((text.chars().count(), Instant::now()));
+            }
+            Ok(_) => {}
+            Err(err) => self.note = format!("could not copy: {err}"),
+        }
+        self.draw_status();
+    }
+
+    fn cancel_selection(&mut self) {
+        if let Some(selecting) = self.selecting.take() {
+            self.clear_selection(selecting);
+        }
+    }
+
+    /// Takes the selection's paint off the pane: the rows as they were, or,
+    /// when the source drew meanwhile, a fresh frame from the source.
+    fn clear_selection(&mut self, selecting: Selecting) {
+        if selecting.stale {
+            self.start_observe();
+        } else {
+            let mut out = b"\x1b[?2026h\x1b7".to_vec();
+            out.extend(selecting.snapshot.restore(selecting.painted));
+            out.extend_from_slice(b"\x1b8\x1b[?2026l");
+            write_out(&out);
+        }
+    }
+
     /// Forwards a mouse event to the source when it lands on the source's
     /// cells: the wheel scrolls it as herdr would, and clicks reach apps that
     /// enabled mouse reporting (herdr drops them otherwise).
-    fn send_mouse(&mut self, mouse: input::Mouse) {
+    fn forward_mouse(&mut self, mouse: input::Mouse) {
         let Some(size) = self.control_size else {
             return;
         };

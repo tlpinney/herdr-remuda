@@ -58,7 +58,7 @@ herdr plugin link .
 
 **Save a view** (`prefix+shift+m`). Names the current tab and saves its layout and mirrors. Other panes come back as shells in their saved directories.
 
-**In a mirror.** The bottom row says where the mirror comes from and how it runs. `ctrl+]` closes it. In a driven mirror, keys, the mouse wheel and clicks go to the source; Shift+Enter arrives as Escape-Enter, which agents such as Claude Code read as a new line. Pastes arrive bracketed, so a multi-line paste lands in one piece instead of submitting line by line. In a driven mirror of another machine, Ctrl+V with an image on your clipboard copies the image to a temporary file there and pastes its path, which agents such as Claude Code attach as an image; with no image, Ctrl+V goes through as usual.
+**In a mirror.** The bottom row says where the mirror comes from and how it runs. `ctrl+]` closes it. In a driven mirror, keys, the mouse wheel and clicks go to the source, and dragging selects text and copies it to this machine's clipboard (hold Alt, Ctrl or Shift to send the drag to the source's app instead); Shift+Enter arrives as Escape-Enter, which agents such as Claude Code read as a new line. Pastes arrive bracketed, so a multi-line paste lands in one piece instead of submitting line by line. In a driven mirror of another machine, Ctrl+V with an image on your clipboard copies the image to a temporary file there and pastes its path, which agents such as Claude Code attach as an image; with no image, Ctrl+V goes through as usual.
 
 **Run herds.** A herd is a named group of agents on one saved machine: one workspace there, labelled with the herd's name, with one tab per agent. From a shell in Herdr:
 

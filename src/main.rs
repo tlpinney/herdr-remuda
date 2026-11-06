@@ -25,6 +25,7 @@ mod presence;
 mod remote;
 mod report;
 mod save;
+mod select;
 mod send;
 mod spec;
 mod view;

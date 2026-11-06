@@ -1125,6 +1125,7 @@ dependencies = [
  "serde_json",
  "signal-hook",
  "toml",
+ "unicode-width",
 ]
 
 [[package]]
